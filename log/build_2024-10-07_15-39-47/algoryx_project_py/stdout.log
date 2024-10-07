@@ -1,0 +1,31 @@
+running egg_info
+creating ../../build/algoryx_project_py/algoryx_project_py.egg-info
+writing ../../build/algoryx_project_py/algoryx_project_py.egg-info/PKG-INFO
+writing dependency_links to ../../build/algoryx_project_py/algoryx_project_py.egg-info/dependency_links.txt
+writing entry points to ../../build/algoryx_project_py/algoryx_project_py.egg-info/entry_points.txt
+writing requirements to ../../build/algoryx_project_py/algoryx_project_py.egg-info/requires.txt
+writing top-level names to ../../build/algoryx_project_py/algoryx_project_py.egg-info/top_level.txt
+writing manifest file '../../build/algoryx_project_py/algoryx_project_py.egg-info/SOURCES.txt'
+reading manifest file '../../build/algoryx_project_py/algoryx_project_py.egg-info/SOURCES.txt'
+writing manifest file '../../build/algoryx_project_py/algoryx_project_py.egg-info/SOURCES.txt'
+running build
+running build_py
+creating /home/ammg-admin/ros2_ws/build/algoryx_project_py/build
+creating /home/ammg-admin/ros2_ws/build/algoryx_project_py/build/lib
+creating /home/ammg-admin/ros2_ws/build/algoryx_project_py/build/lib/algoryx_project_py
+copying algoryx_project_py/__init__.py -> /home/ammg-admin/ros2_ws/build/algoryx_project_py/build/lib/algoryx_project_py
+running install
+running install_lib
+creating /home/ammg-admin/ros2_ws/install/algoryx_project_py/lib/python3.10/site-packages/algoryx_project_py
+copying /home/ammg-admin/ros2_ws/build/algoryx_project_py/build/lib/algoryx_project_py/__init__.py -> /home/ammg-admin/ros2_ws/install/algoryx_project_py/lib/python3.10/site-packages/algoryx_project_py
+byte-compiling /home/ammg-admin/ros2_ws/install/algoryx_project_py/lib/python3.10/site-packages/algoryx_project_py/__init__.py to __init__.cpython-310.pyc
+running install_data
+creating /home/ammg-admin/ros2_ws/install/algoryx_project_py/share/ament_index
+creating /home/ammg-admin/ros2_ws/install/algoryx_project_py/share/ament_index/resource_index
+creating /home/ammg-admin/ros2_ws/install/algoryx_project_py/share/ament_index/resource_index/packages
+copying resource/algoryx_project_py -> /home/ammg-admin/ros2_ws/install/algoryx_project_py/share/ament_index/resource_index/packages
+copying package.xml -> /home/ammg-admin/ros2_ws/install/algoryx_project_py/share/algoryx_project_py
+running install_egg_info
+Copying ../../build/algoryx_project_py/algoryx_project_py.egg-info to /home/ammg-admin/ros2_ws/install/algoryx_project_py/lib/python3.10/site-packages/algoryx_project_py-0.0.0-py3.10.egg-info
+running install_scripts
+writing list of installed files to '/home/ammg-admin/ros2_ws/build/algoryx_project_py/install.log'
