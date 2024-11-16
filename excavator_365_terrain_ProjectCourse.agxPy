@@ -1,0 +1,1860 @@
+# Copyright 2007-2024. Algoryx Simulation AB.
+#
+# All AGX source code, intellectual property, documentation, sample code,
+# tutorials, scene files and technical white papers, are copyrighted,
+# proprietary confidential material of Algoryx Simulation AB. You may not
+# download, read, store, distribute, publish, copy or otherwise disseminate,
+# use or expose this material unless having a written signed agreement with
+# Algoryx Simulation AB, or having been advised so by Algoryx Simulation AB
+# for a time limited evaluation, or having purchased a
+# valid commercial license from Algoryx Simulation AB.
+#
+# Algoryx Simulation AB disclaims all responsibilities for loss or damage
+# caused from using this software, unless otherwise stated in written
+# agreements with Algoryx Simulation AB.
+
+
+"""
+Name: excavator_terrain.agxPy
+Description:
+
+This script demonstrates a scene with an excavator and a deformable
+soil simulation.
+
+An automatic digging sequence can be started by pressing '2'
+
+Or by starting the script with the argument --automatic_digging
+
+The control of the tracks are done using the keyboard:
+
+    - Left Forward:          Home
+    - Left Reverse:          End
+    - Right Forward:         PageUp
+    - Right Reverse:         PageDown
+
+
+Controlling the Cabin/Arm/Bucket:
+
+Keyboard:
+
+    - Arm down:   'z'
+    - Arm up:     'a'
+    - Bucket down: 's'
+    - Bucket up:   'x'
+    - arm down:   Down
+    - arm up:   Up
+
+Gamepad (Xbox like):
+    - stick:   Left_Vertical
+    - Bucket: Left_Horizontal
+    - arm:  Right_Vertical
+    - Cabin: Right_Horizontal
+
+"""
+
+##############################################################################
+# Import required packages
+import agxCollide
+import agx
+import agxSDK
+import agxOSG
+import agxRender
+import agxDriveTrain
+import agxTerrain
+import math
+import sys
+import os
+import argparse
+import collections  # noqa
+from agxPythonModules.utils.environment import simulation, root, application, init_app
+from agxPythonModules.utils.callbacks import StepEventCallback, KeyboardCallback as Input, GamepadCallback as Gamepad
+
+# new imports
+import csv
+# import time
+import random
+import agxIO
+
+paths = ["/data/python/agxTerrain", "/data/python/"]
+for p in paths:
+    folder_path = os.getenv("AGX_DIR") + p
+    if folder_path not in sys.path:
+        sys.path.append(folder_path)
+
+from tutorials.tutorial_utils import createHelpText  # noqa
+
+from importlib import reload  # noqa
+if 'agxPythonModules.models.excavators.excavator365' in sys.modules:
+    reload(sys.modules['agxPythonModules.models.excavators.excavator365'])
+
+from agxPythonModules.models.excavators.excavator365 import Excavator365 as Excavator  # noqa
+
+##############################################################################
+# Create terrain
+terrain01 = True
+terrain02 = False
+
+if terrain01:
+    
+    def height_function(x, y):
+        return 0.0 #numpy.random.normal(loc=0, scale=0.03)
+    
+    def createHeightfield(resolution, size):
+        # Create a heightfield that will be used to define the terrain surface
+        hf = agxCollide.HeightField(resolution[0], resolution[1], size[0], size[1])
+        # Helper functions for constructing the height field surface
+        def hf_index_to_pos(index, dim):
+            return (index / float(resolution[dim]) - 0.5) * size[dim]
+
+        # Set the heights of the height field
+        for i in range(0, resolution[0]):
+            for j in range(0, resolution[1]):
+                height = height_function(hf_index_to_pos(i, 0), hf_index_to_pos(j, 0))
+                hf.setHeight(i, j, height)
+                return hf 
+
+elif terrain02:
+    
+    def height_function(x, y, h, size):
+        """
+        Return a height based on a x, y coordinate
+        """
+        height = 0
+
+        x /= (size / 2.0)
+        y /= (size / 2.0)
+
+        x += 0.55
+
+        r = (x**2 + y**2)**0.5
+        theta = math.atan2(x, y)
+        theta_threshold = math.pi / 12.0
+        theta_min = 50.0 * math.pi / 180.0
+        theta_max = math.pi - theta_min
+        deltaR = 0.15
+        R = 1.25
+        n = 1
+
+        if r > R - deltaR and theta > theta_min and theta < theta_max:
+            if r < R:
+                height = h * math.pow(math.sin((r + deltaR - R) / (2 * deltaR) * math.pi), n)
+            else:
+                height = h
+
+        if theta < (theta_min + theta_threshold):
+            theta = theta - theta_min
+            height *= math.sin(theta / (2 * theta_threshold) * math.pi)
+        
+        if theta > (theta_max - theta_threshold):
+            theta = theta_max - theta
+            height *= math.sin(theta / (2 * theta_threshold) * math.pi)
+
+        return height
+    
+    def create_terrain():
+        """
+        Create a terrain and add it to the simulation.
+        """
+        size = 50 # 20
+        elementSize = 0.25 # 0.1
+        height = 1.5
+        resolution = (math.floor(size / elementSize) + 1)
+        heightField = agxCollide.HeightField(resolution, resolution, size, size)
+
+        # Set the height field heights
+        # Helper functions for constructing the height field surface
+        def hfIndexToPosition(index):
+            return (index / float(resolution) - 0.5) * size
+
+        for i in range(0, resolution):
+            for j in range(0, resolution):
+                heightField.setHeight(i, j, height_function(hfIndexToPosition(i), hfIndexToPosition(j), height, size))
+
+        terrain = agxTerrain.Terrain.createFromHeightField(heightField, 5.0)
+        simulation().add(terrain)
+
+        #
+        # Setup material parameter
+        #
+        terrain.loadLibraryMaterial("DIRT_1")
+        terrain.getTerrainMaterial().getCompactionProperties().setAngleOfReposeCompactionRate(25.0)
+
+        terrain.getProperties().setAvalancheDecayFraction(0.05)
+        terrain.getProperties().setAvalancheMaxHeightGrowth(0.01)
+        terrain.getProperties().setMaximumParticleActivationVolume(1.0)
+        terrain.getProperties().setPenetrationForceVelocityScaling(2.5)
+
+        gridDataInterface = terrain.getTerrainGridControl()
+
+        #
+        # Set compaction on the elevation on the far end
+        #
+        for i in range(0, terrain.getResolutionX()):
+            for j in range(0, terrain.getResolutionY()):
+                terrainIndex = agx.Vec2i(i, j)
+                z = gridDataInterface.findSurfaceIndex(terrainIndex)
+                if z > 0:
+                    curr_z = z
+                    while curr_z > 0:
+                        gridDataInterface.setCompaction(terrainIndex, curr_z, 1.1)
+                        curr_z = curr_z - 1
+
+        return terrain
+
+##############################################################################
+# Setup camera
+camera01 = True
+camera02 = False
+
+def setupCamera(app):
+    if camera01:
+        camera_data = app.getCameraData()
+        camera_data.eye = agx.Vec3(2.22E+01, -1.15E+01, 1.26E+01)
+        camera_data.center = agx.Vec3(3.02E+00, 4.94E+00, 4.34E+00)
+        camera_data.up = agx.Vec3(-1.94E-01, 2.51E-01, 9.48E-01)
+        camera_data.nearClippingPlane = 0.1
+        camera_data.farClippingPlane = 5000
+        app.applyCameraData(camera_data)
+    
+    elif camera02:
+        camera_data = app.getCameraData()
+        camera_data.eye = agx.Vec3(-6.2069, -17.0139, 5.7223)
+        camera_data.center = agx.Vec3(-0.8337, -0.1875, 0.5456)
+        camera_data.up = agx.Vec3(0.0733, 0.2718, 0.9596)
+        camera_data.nearClippingPlane = 0.1
+        camera_data.farClippingPlane = 500
+        app.applyCameraData(camera_data)
+    
+def lerp(a, b, s):
+    if (s > 1):
+        return b
+    if (s <= 0):
+        return a
+
+    return (a * (1 - s) + b * s)
+
+###################################################################################
+# Create rock
+def scale_mesh(vertices: agx.Vec3Vector, scale: agx.Vec3):
+    scaled = agx.Vec3Vector()
+    for v in vertices:
+        scaled.append(agx.Vec3.mul(v, scale))
+    return scaled
+
+def create_rocks(meshes, rock_material, sim, root):
+    rocks = []
+    for i in range(0, 1): #range(0, 2):
+        for j in range(0, 1): #range(0, 2):
+
+            mesh = random.choice(meshes)
+            rock_geometry = agxCollide.Geometry(mesh.shallowCopy())
+            rock_geometry.setMaterial(rock_material)
+            rock = agx.RigidBody(rock_geometry)
+            random_vector = agx.Vec3(random.random(), random.random(), random.random())
+            random_angle = random.uniform(0, 2 * math.pi)
+            rock.setRotation(agx.Quat(random_angle, random_vector))
+            # rock.setPosition(i * 2 + 3, j * 2, 4)
+            rock.setPosition(0, 1.0, 0.5)
+            rock.setVelocity(0, 0, 0)
+            sim.add(rock)
+            agxOSG.createVisual(rock, root)
+            agxSDK.MergeSplitHandler.getOrCreateProperties(rock).setEnableMergeSplit(True)
+            rocks.append(rock)
+    return rock, rocks
+            
+def setup_rocks(sim, root, rock_material):
+    rock_files = ["models/convex_stones/convex_rock2.obj"]
+    # rock_files = ["models/convex_stones/convex_rock2.obj",
+    #               "models/convex_stones/convex_rock3.obj",
+    #               "models/convex_stones/convex_rock4.obj",
+    #               "models/convex_stones/convex_rock5.obj",
+    #               "models/convex_stones/convex_rock6.obj"]
+
+    meshes = []
+
+    for f in rock_files:
+
+        mesh_reader = agxIO.MeshReader()
+        mesh_reader.readFile(f)
+
+        scaled_vertices = scale_mesh(mesh_reader.getVertices(), agx.Vec3(0.001)) # 0.0009
+        mesh = agxCollide.Convex(scaled_vertices, mesh_reader.getIndices(), "rock")
+        meshes.append(mesh)
+
+    random.seed(0)
+    # rocks =[]
+    rock, rocks = create_rocks(meshes, rock_material, sim, root)
+
+    # # A listener to create stones at certain time steps
+    # class StoneListener(agxSDK.StepEventListener):
+    #     def __init__(self):
+    #         super(StoneListener, self).__init__()
+    #         self.interval = 30
+    #         self.step_passed = 30
+
+    #     def pre(self, t: 'agx::TimeStamp const &'):
+
+    #         if self.step_passed == self.interval and t < 0.1: # t < 6:
+    #             new_rocks = create_rocks(meshes, rock_material, sim, root)
+    #             rocks.extend(new_rocks)
+    #             self.step_passed = 0
+
+    #         self.step_passed += 1
+
+    # sim.add(StoneListener())
+    
+    # # Run the simulation for a few steps to allow the listener to create rocks
+    # for _ in range(100):  # Adjust the range as needed to trigger the listener
+    #     sim.stepForward()
+        
+    return rock, rocks
+
+###################################################################################
+# Create joint controller for digging
+class JointController(agxSDK.StepEventListener):
+    """
+    Controlling the movement of a number of joints based on pre-defined poses.
+    A pose consists of an angle/distance and a time.
+    This controller will try to reach the target angle/distance at the specifified time
+    """
+
+    def __init__(self, excavator, joint_poses):
+        super().__init__()
+
+        self.joint_poses = joint_poses
+        self.current_index = 0
+        self.constraints = collections.OrderedDict()
+        self.constraints["cabin"] = excavator.cabin_hinge
+        self.constraints["bucket"] = excavator.bucket_prismatic
+        self.constraints["stick"] = excavator.stick_prismatic
+        self.constraints["arm"] = excavator.arm_prismatics[0]
+
+        range = excavator.arm_prismatics[0].getForceRange()
+        excavator.arm_prismatics[0].setForceRange(agx.RangeReal(range.lower() * 2, range.upper() * 2))
+
+        c = excavator.arm_prismatics[1]
+        c.getMotor1D().setEnable(False)
+        c.getLock1D().setEnable(False)
+
+        self.joint_target_pos = collections.OrderedDict()
+        for name in self.constraints:
+            c = self.constraints[name]
+            self.joint_target_pos[name] = c.getAngle()
+
+    def set_target(self, name, pos):
+        print("set_target", name, pos)
+        self.joint_target_pos[name] = pos
+
+    def pre(self, time):
+        self.updateJointPoses()
+
+    def calculateDamping(self, distance, max_speed):
+        dt = simulation().getTimeStamp()
+        damping = max(2, abs(distance / (dt * max_speed)))
+        return damping
+
+    def updateJointPoses(self):
+        """
+        Loop over all constraint and update the poses
+        """
+        for name in self.constraints:
+            c = self.constraints[name]
+            c.getMotor1D().setEnable(False) # Motor requires constant supply of speed
+            c.getLock1D().setEnable(True) # Lock drives component to its 'next' position
+
+            curr = c.getAngle()
+            next = self.joint_target_pos[name]
+            distance = abs(next - curr)
+
+            s = distance * 0.1 # Smoothens the movement trajectory
+
+            # Now interpolate (using log scale) the damping
+            damping = agx.logInterpolate(2 / 100, 1.5, 1 - s)
+            damping = max(damping, 2 / 60)
+            c.getLock1D().setDamping(damping)
+            c.getLock1D().setForceRange(c.getMotor1D().getForceRange())
+            # Set the target position/angle
+            c.getLock1D().setPosition(next)
+
+###################################################################################
+# Build Scene
+def buildScene1(use_keyboard_gamepad=False):
+    ###################################################################################
+    # Initial settings
+    arguments = application().getArguments()
+    argument_string = [arguments.getArgumentName(a) for a in range(2, arguments.getNumArguments())]
+    # Handle argument
+    ap = argparse.ArgumentParser(argument_string)
+    ap.add_argument("--automatic_digging", action="store_true", help="If specified the excavator will start an automatic digging sequence")
+    args, unknown = ap.parse_known_args(argument_string)
+    args = vars(args)
+    
+    ###################################################################################
+    if terrain01:
+        
+        # Create the terrain from a height field, set maximum depth to 5m and add it to the simulation
+        res = (200, 200)
+        size = (50, 50)
+        terrain = agxTerrain.Terrain.createFromHeightField(createHeightfield(res, size), 5.0)
+
+        simulation().add(terrain)
+
+        # Load a material from the material library, this sets
+        #   - Bulk material
+        #   - Particle material
+        #   - Terrain material
+        #   - Particle-Particle contact material
+        #   - Particle-Terrain contact material
+        #   - Aggregate-Terrain contact material
+        # WARNING:  Changing ANY material, terrain material or contact material retrieved from Terrain will invalidate these settings!
+        terrain.loadLibraryMaterial("SAND_1")
+        terrain.getTerrainMaterial().getCompactionProperties().setAngleOfReposeCompactionRate(24.0)
+        terrain.getTerrainMaterial().getBulkProperties().setYoungsModulus(1e6)
+        
+        # Setup a renderer for the terrain.
+        renderer = agxOSG.TerrainVoxelRenderer(terrain, root())
+        renderer.setRenderHeights(True, agx.RangeReal(-1.25, 1.25))
+        # Render the particles as textured meshes.
+        renderer.setRenderSoilParticlesMesh(True)
+
+        # Enable the rendering of compaction
+        renderer.setRenderCompaction(True, agx.RangeReal(0.85, 1.15))
+    
+    elif terrain02:
+        
+        terrain = create_terrain()
+        
+        renderer = agxOSG.TerrainVoxelRenderer(terrain, root())
+        renderer.setRenderCompaction(True, agx.RangeReal(0.85, 1.15))
+        renderer.setRenderVoxelFluidMass(False)
+        renderer.setRenderSoilParticlesMesh(True)
+        renderer.setRenderVoxelSolidMass(False)
+        renderer.setRenderCompaction(True)
+        renderer.setRenderVoxelBoundingBox(False)
+        renderer.setRenderVelocityField(False)
+        renderer.setVelocityFieldLineColor(agx.Vec4(0, 0, 1, 1))
+        renderer.setRenderSoilParticles(False)
+        
+    simulation().add(renderer)
+    
+    ###################################################################################
+    # Gamepad control settings
+
+    keyboard_controls = None
+    gamepad_controls = None
+
+    # Should we use interactive control?
+    if use_keyboard_gamepad:
+        keyboard_controls = Excavator.default_keyboard_settings()
+        gamepad_controls = Excavator.default_gamepad_controls()
+        
+        gamepad_controls.bucket.axis = Gamepad.Axis.RightHorizontal 
+        gamepad_controls.bucket.doc = "Bucket - RightHorizontal - Amirmasoud"
+        
+        gamepad_controls.stick.axis = Gamepad.Axis.LeftVertical
+        gamepad_controls.stick.doc = "Stick - LeftVertical - Amirmasoud"
+        
+        gamepad_controls.arm.axis = Gamepad.Axis.LeftHorizontal
+        gamepad_controls.arm.doc = "Arm - LeftHorizontal - Amirmasoud"
+        
+        gamepad_controls.cabin_rotate.axis = Gamepad.Axis.RightVertical
+        gamepad_controls.cabin_rotate.doc = "Cabin - RightVertical - Amirmasoud"
+    
+    ###################################################################################
+    # Create an excavator
+    excavator = Excavator(gamepad_controls=gamepad_controls, keyboard_controls=keyboard_controls)
+    excavator.setRotation(terrain.getRotation())
+    excavator.setPosition(0, 10, 0)
+    simulation().add(excavator)
+
+    # Show keyboard documentation
+    if excavator.keyboard_controls:
+        print("\n\nKeyboard bindings:")
+        print("-------------------")
+        for name, control in excavator.keyboard_controls:
+            print(control.doc)
+
+    # Show gamepad documentation
+    if excavator.gamepad_controls:
+        print("\n\nGamepad bindings:")
+        print("-------------------")
+        for name, control in excavator.gamepad_controls:
+            print(control.doc)
+    
+    ###################################################################################
+    # Automatic digging
+    def start_automatic_digging():
+        """
+        Start an automatic digging process with pre-defined operations.
+        """
+
+        excavator.gamepad_controls = None
+
+        print("Starting Automatic digging cycle")
+
+        def digCycle(start_time, arm_height, cabin_start):
+            """
+            Creates a number of poses that together form a digging cycle
+            """
+
+            return [
+                [start_time + 0, {'cabin': cabin_start + 0.0}],
+                [start_time + 3, {'stick': -0.9}],
+                [start_time + 3, {'bucket': -0.7}],
+                [start_time + 3, {'arm': arm_height + 0.1}], # Originally + 0.1
+                [start_time + 5, {'arm': arm_height - 0.25}], # Originally - 0.25
+                [start_time + 6, {'stick': 0.3}],
+                [start_time + 6, {'arm': arm_height - 0.2}],
+                [start_time + 7, {'arm': arm_height + 0.02}],
+                [start_time + 7, {'stick': 0.7}],
+                [start_time + 7, {'bucket': 0.1}],
+                [start_time + 9, {'arm': arm_height + 0.5}],
+                [start_time + 11, {'cabin': cabin_start + 0.6}],
+                [start_time + 13, {'bucket': -0.15}],
+                [start_time + 13, {'stick': -0.4}],
+                [start_time + 14, {'bucket': -0.65}],
+                [start_time + 15, {'bucket': -0.8}]
+            ]
+
+        def set_speed(speed):
+            """
+            Set the speed of the driving hinges of the excavator
+            """
+            for h in excavator.sprocket_hinges:
+                print("Speed: ", speed)
+                h.getLock1D().setEnable(False)
+                h.getMotor1D().setEnable(True)
+                h.getMotor1D().setSpeed(speed)
+
+        def drive_excavator(start, speed, duration):
+            """
+            Start driving forward at a specific time, with a given speed during a specified period
+
+            Arguments:
+                start - start time
+                speed - target speed
+                duration - Duration of the motion
+            """
+            StepEventCallback.callIn(start, lambda speed=speed: set_speed(speed))
+            StepEventCallback.callIn(start + duration, lambda: set_speed(0))
+
+        poses = []
+        time = 0
+        # Create an array with all the poses that we want to do
+        for i in range(0, 30): # Number of times the digging cycle should be implemented
+            poses.extend(digCycle(i * 15, -i * 0.01, math.radians(90)))
+            time += 15
+            drive_excavator(i * 15, -1, 2)
+
+        print("Total cycle time: ", time)
+
+        joint_controller = JointController(excavator, poses)
+
+        # Setup all the events for all the digging cycles
+        for p in poses:
+            time = p[0]
+            i = 0
+            for name in p[1]:
+                i += 1
+                val = p[1][name]
+                arg = [name, val]
+                StepEventCallback.callIn(time, lambda arg=arg: joint_controller.set_target(arg[0], arg[1]))
+
+        simulation().add(joint_controller)
+
+    # Bind a keyboard button for starting the automatic digging cycle
+    Input.bind(name='Automatic Digging',
+               key=ord('2'),
+               mode=Input.Mode.NATIVE,
+               callback=lambda data: start_automatic_digging())
+
+    if (args["automatic_digging"]):
+        start_automatic_digging()
+
+    def show_text(flag):
+        if (flag):
+            application().getSceneDecorator().setText(1, "Press 2 to start automatic digging")
+        else:
+            application().getSceneDecorator().setText(1, "")
+
+    show_text(True)
+    StepEventCallback.callAt(4, lambda: show_text(False))
+    
+    ###################################################################################
+    # Configure the contact material between the tracks and the ground(terrain)
+    excavator.configure_track_ground_contact_materials(terrain)
+    
+    # Code behind this section
+    # track_ground_cm = (global_simulation().getMaterialManager().getOrCreateContactMaterial(track_material, ground_material))
+    # track_ground_cm.setRestitution(0)
+    # track_ground_cm.setFrictionCoefficient(1.0, agx.ContactMaterial.PRIMARY_DIRECTION)
+    # track_ground_cm.setFrictionCoefficient(0.25, agx.ContactMaterial.SECONDARY_DIRECTION)
+    # track_ground_cm.setSurfaceViscosity(1.0e-6, agx.ContactMaterial.PRIMARY_DIRECTION)
+    # track_ground_cm.setSurfaceViscosity(6.0e-6, agx.ContactMaterial.SECONDARY_DIRECTION)
+    
+    # # Track ground uses a very specific friction model for performance purposes. It requires the mass of the machine
+    # track_ground_cm.setFrictionModel(agx.ConstantNormalForceOrientedBoxFrictionModel(0.5 * self.get_mass(),self.chassie_body.getFrame(),agx.Vec3.Y_AXIS(),agx.FrictionModel.DIRECT,False,))
+    # track_ground_cm.setYoungsModulus(1.0e10)
+    
+    ###################################################################################
+    # Set contact materials of the terrain and bucket
+    particle_material = terrain.getMaterial(agxTerrain.Terrain.MaterialType_PARTICLE)
+    bucket_particle_cm = simulation().getMaterialManager().getOrCreateContactMaterial(particle_material, excavator.bucket_material)
+
+    bucket_particle_cm.setYoungsModulus(1e9)
+    bucket_particle_cm.setRestitution(0.0)
+    bucket_particle_cm.setFrictionCoefficient(0.7)
+    bucket_particle_cm.setRollingResistanceCoefficient(0.7)
+        
+    ###################################################################################    
+    # Create the Shovel object
+    top_edge = excavator.top_edge
+    cutting_edge = excavator.cutting_edge
+
+    forwardVector = excavator.forward_cutting_vector
+
+    # Create the Shovel object using the previously defined cutting and top edge
+    terrain_shovel = agxTerrain.Shovel(excavator.bucket_body, top_edge, cutting_edge, forwardVector)
+    # Set the maximum distance to solid terrain for leveling using this shovel
+    terrain_shovel.setVerticalBladeSoilMergeDistance(0.0)
+    # Set a margin around the bounding box of the shovel where particles are not to be merged
+    terrain_shovel.setNoMergeExtensionDistance(0.1)
+    terrain_shovel.setContactRegionVerticalLimit(0.2)
+    terrain_shovel.setContactRegionThreshold(0.1)
+    terrain_shovel.getExcavationSettings(agxTerrain.Shovel.ExcavationMode_DEFORM_BACK).setEnable(True)
+
+    # Set the contact stiffness multiplier for the generated contacts between the soil aggregates <-> terrain for excavation
+    # and deformation. The final Young's modulus value that will be used in the contact material thus becomes:
+    #       YM_final = BulkYoungsModulus * stiffnessMultiplier
+    terrain.getTerrainMaterial().getExcavationContactProperties().setAggregateStiffnessMultiplier(5e-5)
+
+    # Sets the maximum volume (m3) of active zone wedges that should wake particles.
+    terrain.getProperties().setMaximumParticleActivationVolume(2)
+    terrain.getProperties().setSoilParticleSizeScaling(0.4)
+
+    # Add the shovel to the terrain
+    terrain.add(terrain_shovel)
+    
+    ###################################################################################
+    # Create rocks
+    rock_material = agx.Material("Rocks")
+    rock_material.getBulkMaterial().setDensity(2000)
+    rock, rocks = setup_rocks(simulation(), root(), rock_material)
+    
+    ###################################################################################
+    # Set contact materials of the terrain and rock
+    terrain_material = terrain.getMaterial(agxTerrain.Terrain.MaterialType_TERRAIN)
+    rock_particle_cm = simulation().getMaterialManager().getOrCreateContactMaterial(terrain_material, rock_material)
+    # rock_particle_cm = simulation().getMaterialManager().getOrCreateContactMaterial(rock_material, particle_material)
+    simulation().add(rock_particle_cm)
+    
+    ###################################################################################
+    # # Rotating cabin hinge
+    # def set_position_cabin_hinge(next_position):
+    #     c = excavator.cabin_hinge
+    #     c.getMotor1D().setEnable(False)
+    #     c.getLock1D().setEnable(True)
+
+    #     curr = c.getAngle()
+    #     next = next_position #-1.6
+    #     distance = abs(next - curr)
+
+    #     s = distance * 0.1
+
+    #     # Now interpolate (using log scale) the damping
+    #     damping = agx.logInterpolate(2 / 100, 1.5, 1 - s)
+    #     damping = max(damping, 2 / 60)
+    #     c.getLock1D().setDamping(damping)
+    #     c.getLock1D().setForceRange(c.getMotor1D().getForceRange())
+    #     # Set the target position/angle
+    #     c.getLock1D().setPosition(next)
+    
+    # start = 0 
+    # next_position = -1.6 
+    # StepEventCallback.callIn(start, lambda next_position=next_position: set_position_cabin_hinge(next_position))
+    
+    # # Rotating bucket prismatic
+    # def set_position_bucket_prismatic(next_position):
+    #     c = excavator.bucket_prismatic
+    #     c.getMotor1D().setEnable(False)
+    #     c.getLock1D().setEnable(True)
+
+    #     curr = c.getAngle()
+    #     next = next_position#-0.8
+    #     distance = abs(next - curr)
+
+    #     s = distance * 0.1
+
+    #     # Now interpolate (using log scale) the damping
+    #     damping = agx.logInterpolate(2 / 100, 1.5, 1 - s)
+    #     damping = max(damping, 2 / 60)
+    #     c.getLock1D().setDamping(damping)
+    #     c.getLock1D().setForceRange(c.getMotor1D().getForceRange())
+    #     # Set the target position/angle
+    #     c.getLock1D().setPosition(next)
+            
+    # # start = 0 
+    # next_position = -0.8
+    # StepEventCallback.callIn(start, lambda next_position=next_position: set_position_bucket_prismatic(next_position))
+    
+    # # Rotating arm prismatics
+    # def set_position_arm_prismatic(next_position):
+    #     cc = excavator.arm_prismatics[1]
+    #     cc.getMotor1D().setEnable(False)
+    #     cc.getLock1D().setEnable(False)
+            
+    #     curr = cc.getAngle()
+    #     next = next_position #-0.06
+    #     distance = abs(next - curr)
+
+    #     s = distance * 0.1
+
+    #     # Now interpolate (using log scale) the damping
+    #     damping = agx.logInterpolate(2 / 100, 1.5, 1 - s)
+    #     damping = max(damping, 2 / 60)
+    #     cc.getLock1D().setDamping(damping)
+    #     cc.getLock1D().setForceRange(cc.getMotor1D().getForceRange())
+    #     # Set the target position/angle
+    #     cc.getLock1D().setPosition(next)
+            
+            
+    #     c = excavator.arm_prismatics[0]
+    #     c.getMotor1D().setEnable(False)
+    #     c.getLock1D().setEnable(True)
+
+    #     curr = c.getAngle()
+    #     next = next_position #-0.06
+    #     distance = abs(next - curr)
+
+    #     s = distance * 0.1
+
+    #     # Now interpolate (using log scale) the damping
+    #     damping = agx.logInterpolate(2 / 100, 1.5, 1 - s)
+    #     damping = max(damping, 2 / 60)
+    #     c.getLock1D().setDamping(damping)
+    #     c.getLock1D().setForceRange(c.getMotor1D().getForceRange())
+    #     # Set the target position/angle
+    #     c.getLock1D().setPosition(next)
+            
+    # # start = 0 
+    # next_position = -0.06
+    # delay = 8
+    # StepEventCallback.callIn(start + delay, lambda next_position=next_position: set_position_arm_prismatic(next_position))
+    
+    ###################################################################################
+    # Show Frames
+    Under_carriage_body_obj = excavator.under_carriage_body
+    Bucket_body_obj= excavator.bucket_body
+    Chassie_body_obj = excavator.chassie_body
+    
+    
+    # agxOSG.createAxes(None, Bucket_body_obj.getFrame().getMatrix(), root(), 1.0) 
+    # agxOSG.createAxes(None, Bucket_body_obj.getCmFrame().getMatrix(), root(), 1.0) 
+    # agxOSG.createAxes(None, Bucket_body_obj.getParentFrame().getMatrix(), root(), 3.0)
+    
+    # agxOSG.createAxes(None, Under_carriage_body_obj.getFrame().getMatrix(), root(), 3.0) 
+    # agxOSG.createAxes(None, Under_carriage_body_obj.getCmFrame().getMatrix(), root(), 3.0) 
+    # agxOSG.createAxes(None, Under_carriage_body_obj.getParentFrame().getMatrix(), root(), 3.0) 
+    
+    # agxOSG.createAxes(None, Chassie_body_obj.getFrame().getMatrix(), root(), 3.0) 
+    # agxOSG.createAxes(None, Chassie_body_obj.getCmFrame().getMatrix(), root(), 3.0) 
+    # agxOSG.createAxes(None, Chassie_body_obj.getParentFrame().getMatrix(), root(), 3.0) 
+    
+    # agxOSG.createAxes(None, excavator.getFrame().getMatrix(), root(), 3.0)
+    # agxOSG.createAxes(None, excavator.getParentFrame(), root(), 2.0) 
+    
+    # agxOSG.createAxes(None, rock.getFrame().getMatrix(), root(), 1.0) 
+    # agxOSG.createAxes(None, rock.getCmFrame().getMatrix(), root(), 1.0) 
+    # agxOSG.createAxes(None, rock.getParentFrame(), root(), 1.0) 
+    # agxOSG.createAxes(None, rock.getCmTransform(), root(), 1.0)
+    # agxOSG.createAxes(None, rock.getTransform(), root(), 1.0)
+    
+    # agxOSG.createAxes(Bucket_body_obj, excavator.getParentFrame(), root(), 1.0)
+    # agxOSG.createAxes(Chassie_body_obj, excavator.getParentFrame(), root(), 3.0)
+    # agxOSG.createAxes(Under_carriage_body_obj, excavator.getParentFrame(), root(), 3.0)
+    # agxOSG.createAxes(rock, excavator.getParentFrame(), root(), 1.0)
+    
+    # agxOSG.createAxes(excavator.getParentFrame(), root(), 5.0)
+    # agxOSG.createAxes(excavator.getFrame().getMatrix(),excavator.getParentFrame(), root(), 3.0)
+    
+    ###################################################################################
+    # frameRockInWorld = agx.ObserverFrame("RockOrigo", rock) 
+    frameRockInWorld = agx.ObserverFrame()
+    frameRockInWorld.attachWithWorldTransform(rock, rock.getFrame().getMatrix())
+    simulation().add(frameRockInWorld)
+    agxOSG.createVisual(frameRockInWorld, root(), 1.0)
+    
+    frameRockCMInWorld = agx.ObserverFrame()
+    frameRockCMInWorld.attachWithWorldTransform(rock, rock.getCmFrame().getMatrix())
+    simulation().add(frameRockCMInWorld)
+    agxOSG.createVisual(frameRockCMInWorld, root(), 1.0)
+    
+    # frameBucketInWorld = agx.ObserverFrame("bucketOrigo", Bucket_body_obj)
+    frameBucketInWorld = agx.ObserverFrame()
+    frameBucketInWorld.attachWithWorldTransform(Bucket_body_obj, Bucket_body_obj.getFrame().getMatrix())
+    simulation().add(frameBucketInWorld)
+    agxOSG.createVisual(frameBucketInWorld, root(), 2.0)
+    
+    frameBucketCMInWorld = agx.ObserverFrame()
+    frameBucketCMInWorld.attachWithWorldTransform(Bucket_body_obj, Bucket_body_obj.getCmFrame().getMatrix())
+    simulation().add(frameBucketCMInWorld)
+    agxOSG.createVisual(frameBucketCMInWorld, root(), 2.0)
+    
+    # frameCarriageInWorld = agx.ObserverFrame("carriageOrigo", Under_carriage_body_obj)
+    frameCarriageInWorld = agx.ObserverFrame()
+    frameCarriageInWorld.attachWithWorldTransform(Under_carriage_body_obj, Under_carriage_body_obj.getFrame().getMatrix())
+    simulation().add(frameCarriageInWorld)
+    agxOSG.createVisual(frameCarriageInWorld, root(), 3.0)
+    
+    # frameChassieInWorld = agx.ObserverFrame("ChassieOrigo", Chassie_body_obj)
+    frameChassieInWorld = agx.ObserverFrame()
+    frameChassieInWorld.attachWithWorldTransform(Chassie_body_obj, Chassie_body_obj.getFrame().getMatrix())
+    simulation().add(frameChassieInWorld)
+    agxOSG.createVisual(frameChassieInWorld, root(), 3.0)
+    
+    # frameExcavatorInWorld = agx.ObserverFrame("ExcavatorOrigo", excavator.getParentFrame())
+    frameExcavatorInWorld = agx.ObserverFrame()
+    frameExcavatorInWorld.attachWithWorldTransform(excavator.getParentFrame())
+    simulation().add(frameExcavatorInWorld)
+    agxOSG.createVisual(frameExcavatorInWorld, root(), 3.0)
+    
+    ###################################################################################
+    frameBucketInExcavator = agx.ObserverFrame("BucketExcavator", Bucket_body_obj, excavator.getFrame().getMatrix())
+    # frameBucketInExcavator = agx.ObserverFrame( "BucketExcavator", Bucket_body_obj, Bucket_body_obj.getParentFrame().getMatrix())
+    simulation().add(frameBucketInExcavator)
+    # agxOSG.createVisual(frameBucketInExcavator, root(), 3.0)
+    
+    # frameRockInExcavator = agx.ObserverFrame( "RockExcavator", rock, Bucket_body_obj.getParentFrame().getMatrix())
+    frameRockInExcavator = agx.ObserverFrame( "RockExcavator", rock, excavator.getFrame().getMatrix())
+    simulation().add(frameRockInExcavator)
+    # agxOSG.createVisual(frameRockInExcavator, root(), 3.0)
+    
+    frameRockInBucket = agx.ObserverFrame( "RockBucket", rock, Bucket_body_obj.getFrame().getMatrix())
+    simulation().add(frameRockInBucket)
+    # agxOSG.createVisual(frameRockInBucket, root(), 3.0)
+    
+    ###################################################################################
+    # Save Variables
+    def create_printer():
+        def printer(_):
+            folder_path = 'Collected_Data'
+            sd = application().getSceneDecorator()
+            sd.clearText()
+            
+            penForce_tot = agx.Vec3()
+            sepForce_tot = agx.Vec3()
+            deformer_tot = agx.Vec3()
+            subForce_tot = agx.Vec3()
+
+            penForce = agx.Vec3()
+            torque = agx.Vec3()
+            terrain.getPenetrationForce(terrain_shovel, penForce, torque)
+            penForce_tot = penForce / 1e3
+            sepForce_tot = terrain.getSeparationContactForce(terrain_shovel) / 1e3
+            subForce_tot = terrain.getContactForce(terrain_shovel) / 1e3
+            deformer_tot = terrain.getDeformationContactForce(terrain_shovel) / 1e3
+
+            force = penForce_tot + sepForce_tot + deformer_tot
+            color = agxRender.Color.Blue()
+            
+            primary_force = -terrain.getExcavationModeContactForce(terrain_shovel, agxTerrain.Shovel.ExcavationMode_PRIMARY) / 1e3
+            deformerLeft_force = -terrain.getExcavationModeContactForce(terrain_shovel, agxTerrain.Shovel.ExcavationMode_DEFORM_LEFT) / 1e3
+            deformerRight_force = -terrain.getExcavationModeContactForce(terrain_shovel, agxTerrain.Shovel.ExcavationMode_DEFORM_RIGHT) / 1e3
+            deformerBack_force = -terrain.getExcavationModeContactForce(terrain_shovel, agxTerrain.Shovel.ExcavationMode_DEFORM_BACK) / 1e3
+
+            primary_t_force = -terrain.getAggregateTerrainTangentialForce(terrain_shovel, agxTerrain.Shovel.ExcavationMode_PRIMARY) / 1e3
+            deformerLeft_t_force = -terrain.getAggregateTerrainTangentialForce(terrain_shovel, agxTerrain.Shovel.ExcavationMode_DEFORM_LEFT) / 1e3
+            deformerRight_t_force = -terrain.getAggregateTerrainTangentialForce(terrain_shovel, agxTerrain.Shovel.ExcavationMode_DEFORM_RIGHT) / 1e3
+            deformerBack_t_force = -terrain.getAggregateTerrainTangentialForce(terrain_shovel, agxTerrain.Shovel.ExcavationMode_DEFORM_BACK) / 1e3
+
+            primary_aggregate_area = terrain.getAggregateTerrainContactArea(terrain_shovel, agxTerrain.Shovel.ExcavationMode_PRIMARY)
+            deformerLeft_aggregate_area = terrain.getAggregateTerrainContactArea(terrain_shovel, agxTerrain.Shovel.ExcavationMode_DEFORM_LEFT)
+            deformerRight_aggregate_area = terrain.getAggregateTerrainContactArea(terrain_shovel, agxTerrain.Shovel.ExcavationMode_DEFORM_RIGHT)
+            deformerBack_aggregate_area = terrain.getAggregateTerrainContactArea(terrain_shovel, agxTerrain.Shovel.ExcavationMode_DEFORM_BACK)
+            
+            ###################################################################################
+            # Time of Simulation
+            sd.setText(0, "Time of simulation:  ({:5.2f}) s".format(simulation().getTimeStamp()), color)
+            ###################################################################################       
+            
+            sd.setText(1, "Penetration force:    ({:5.2f}, {:5.2f}, {:5.2f}) kN".format(penForce_tot.x(), penForce_tot.y(), penForce_tot.z()), color)
+            sd.setText(2, "Separation force:     ({:5.2f}, {:5.2f}, {:5.2f}) kN".format(sepForce_tot.x(), sepForce_tot.y(), sepForce_tot.z()), color)
+            sd.setText(3, "Deformer force:       ({:5.2f}, {:5.2f}, {:5.2f}) kN".format(deformer_tot.x(), deformer_tot.y(), deformer_tot.z()), color)
+            sd.setText(4, "Submerged force:      ({:5.2f}, {:5.2f}, {:5.2f}) kN".format(subForce_tot.x(), subForce_tot.y(), subForce_tot.z()), color)
+            sd.setText(5, "Total force:          ({:5.2f}, {:5.2f}, {:5.2f}) kN".format(force.x(), force.y(), force.z()), color)
+            sd.setText(7, "Separation Force:      ({:5.2f}) kN".format(primary_force.length()), color)
+            sd.setText(8, "Deformer Left Force:   ({:5.2f}) kN".format(deformerLeft_force.length()), color)
+            sd.setText(9, "Deformer Right Force:  ({:5.2f}) kN".format(deformerRight_force.length()), color)
+            sd.setText(10, "Deformer Back Force :  ({:5.2f}) kN".format(deformerBack_force.length()), color)
+
+            sd.setText(12, "Separation Agg. Tangential Force:     ({:5.2f}) kN".format(primary_t_force.length()), color)
+            sd.setText(13, "Deformer Left Agg. Tangential Force:  ({:5.2f}) kN".format(deformerLeft_t_force.length()), color)
+            sd.setText(14, "Deformer Right Agg. Tangential Force: ({:5.2f}) kN".format(deformerRight_t_force.length()), color)
+            sd.setText(15, "Deformer Back Agg. Tangential Force:  ({:5.2f}) kN".format(deformerBack_t_force.length()), color)
+
+            sd.setText(17, "Shovel Inner Contact Area:    ({:5.2f}) m2".format(terrain_shovel.getInnerContactArea()), color)
+            sd.setText(18, "Separation Area:     ({:5.2f}) m3".format(primary_aggregate_area), color)
+            sd.setText(19, "Deformer Left Area:  ({:5.2f}) m3".format(deformerLeft_aggregate_area), color)
+            sd.setText(20, "Deformer Right Area: ({:5.2f}) m3".format(deformerRight_aggregate_area), color)
+            sd.setText(21, "Deformer Back Area:  ({:5.2f}) m3".format(deformerBack_aggregate_area), color) 
+            
+            ###################################################################################
+            # Measuring the amount of material in a bucket?
+            # Get the tool collection associated with the shovel
+            tool_collection = terrain.getToolCollection(terrain_shovel)
+            # Get the soil particle aggregate from the tool collection
+            soil_particle_aggregate = tool_collection.getSoilParticleAggregate()
+            # Get the mass of the soil particle aggregate
+            inner_body_mass = soil_particle_aggregate.getMass()
+            # Get the total aggregate mass of the soil particle aggregate
+            total_aggregate_mass = soil_particle_aggregate.getTotalAggregateMass()
+            # Calculate the wedge body mass
+            wedge_body_mass = total_aggregate_mass - inner_body_mass
+            # Print or use the mass as needed
+            sd.setText(23, "Inner body mass:          ({:5.2f}) kg".format(inner_body_mass), color) 
+            sd.setText(24, "Wedge bodies mass:        ({:5.2f}) kg".format(wedge_body_mass), color)
+            
+            ###################################################################################
+            # # Save contact forces in csv file
+            # filename = os.path.join(folder_path, 'ContactForceVariables.csv')
+            
+            # # Define the header
+            # header = ['Time',
+            #           'penForce_tot.x()', 'penForce_tot.y()', 'penForce_tot.z()',
+            #           'sepForce_tot.x()', 'sepForce_tot.y()', 'sepForce_tot.z()',
+            #           'deformer_tot.x()', 'deformer_tot.y()', 'deformer_tot.z()',
+            #           'subForce_tot.x()', 'subForce_tot.y()', 'subForce_tot.z()',
+            #           'force.x()',        'force.y()',        'force.z()',
+            #           'inner_body_mass',  'wedge_body_mass']  
+                            
+            # if os.path.exists(filename) and simulation().getTimeStamp()<=0:
+            #     os.remove(filename)
+            # else:
+            #     with open(filename, mode='a', newline='') as file:
+            #         writer = csv.writer(file)
+                    
+            #         # Write the header only if the file is empty
+            #         if os.path.getsize(filename) == 0:
+            #             writer.writerow(header)
+                    
+            #         # Write the data row   
+            #         writer.writerow([simulation().getTimeStamp(), 
+            #                      penForce_tot.x(), penForce_tot.y(), penForce_tot.z(),
+            #                      sepForce_tot.x(), sepForce_tot.y(), sepForce_tot.z(),
+            #                      deformer_tot.x(), deformer_tot.y(), deformer_tot.z(),
+            #                      subForce_tot.x(), subForce_tot.y(), subForce_tot.z(),
+            #                      force.x(), force.y(), force.z(),
+            #                      inner_body_mass, wedge_body_mass])
+                    
+            ###################################################################################            
+            # Frame Bucket in Excavator
+            # Current model frame position, given in world coordinate frame. 
+            positionBucketInExcavator = frameBucketInExcavator.getPosition()
+            
+            # Current model frame rotation, given in world coordinate frame. 
+            rotationBucketInExcavator = frameBucketInExcavator.getRotation()
+            rotationEABucketInExcavator = rotationBucketInExcavator.getAsEulerAngles()
+            
+            # Returns the model frame containing model the transformation and utilities to manipulate position, rotation etc. 
+            # getFrameBucketInExcavator = frameBucketInExcavator.getFrame()
+            
+            # the velocity of the ObserverFrame in the world 
+            velocityBucketInExcavator = frameBucketInExcavator.getVelocity()
+            
+            # the angular velocity of the ObserverFrame in the world 
+            angVelocityBucketInExcavator = frameBucketInExcavator.getAngularVelocity()
+            
+            # the acceleration of the ObserverFrame in the world 
+            accelerationBucketInExcavator = frameBucketInExcavator.getAcceleration()
+            
+            # the angular acceleration of the ObserverFrame in the world 
+            angAccelerationBucketInExcavator = frameBucketInExcavator.getAngularAcceleration()
+            
+            # the relative translate to this frame's parent frame 
+            locPositionBucketInExcavator = frameBucketInExcavator.getLocalPosition()
+            
+            # the relative rotation to this frame's parent frame 
+            locRotationBucketInExcavator = frameBucketInExcavator.getLocalRotation()
+            locRotationEABucketInExcavator = locRotationBucketInExcavator.getAsEulerAngles()
+            
+            # the local transformation matrix (i.e., the transformation relative to the parent) 
+            # transformationBucketInExcavator = frameBucketInExcavator.getLocalTransform()
+            
+            # # Save Bucket-Excavator's motion variables in csv file
+            # filename = os.path.join(folder_path, 'ObserverFrameBucketExcavator.csv')
+            
+            # # Define the header
+            # header = ['Time',
+            #         'positionBucketInExcavator.x()', 'positionBucketInExcavator.y()', 'positionBucketInExcavator.z()',
+            #         'rotationBucketInExcavator.w()', 'rotationBucketInExcavator.x()', 'rotationBucketInExcavator.y()', 'rotationBucketInExcavator.z()',
+            #         'rotationEABucketInExcavator.x()', 'rotationEABucketInExcavator.y()', 'rotationEABucketInExcavator.z()',
+            #         'velocityBucketInExcavator.x()', 'velocityBucketInExcavator.y()', 'velocityBucketInExcavator.z()',
+            #         'angVelocityBucketInExcavator.x()', 'angVelocityBucketInExcavator.y()', 'angVelocityBucketInExcavator.z()',
+            #         'accelerationBucketInExcavator.x()', 'accelerationBucketInExcavator.y()', 'accelerationBucketInExcavator.z()',
+            #         'angAccelerationBucketInExcavator.x()', 'angAccelerationBucketInExcavator.y()', 'angAccelerationBucketInExcavator.z()',
+            #         'locPositionBucketInExcavator.x()', 'locPositionBucketInExcavator.y()', 'locPositionBucketInExcavator.z()',
+            #         'locRotationBucketInExcavator.w()', 'locRotationBucketInExcavator.x()', 'locRotationBucketInExcavator.y()', 'locRotationBucketInExcavator.z()',
+            #         'locRotationEABucketInExcavator.x()', 'locRotationEABucketInExcavator.y()', 'locRotationEABucketInExcavator.z()']
+            
+            # if os.path.exists(filename) and simulation().getTimeStamp()<=0:
+            #     os.remove(filename)
+            # else:
+            #     with open(filename, mode='a', newline='') as file:
+            #         writer = csv.writer(file)
+                    
+            #         # Write the header only if the file is empty
+            #         if os.path.getsize(filename) == 0:
+            #             writer.writerow(header)
+                    
+            #         writer.writerow([simulation().getTimeStamp(),
+            #                         positionBucketInExcavator.x(), positionBucketInExcavator.y(), positionBucketInExcavator.z(),
+            #                         rotationBucketInExcavator.w(), rotationBucketInExcavator.x(), rotationBucketInExcavator.y(), rotationBucketInExcavator.z(),
+            #                         rotationEABucketInExcavator.x(), rotationEABucketInExcavator.y(), rotationEABucketInExcavator.z(),
+            #                         velocityBucketInExcavator.x(), velocityBucketInExcavator.y(), velocityBucketInExcavator.z(),
+            #                         angVelocityBucketInExcavator.x(), angVelocityBucketInExcavator.y(), angVelocityBucketInExcavator.z(),
+            #                         accelerationBucketInExcavator.x(), accelerationBucketInExcavator.y(), accelerationBucketInExcavator.z(),
+            #                         angAccelerationBucketInExcavator.x(), angAccelerationBucketInExcavator.y(), angAccelerationBucketInExcavator.z(),
+            #                         locPositionBucketInExcavator.x(), locPositionBucketInExcavator.y(), locPositionBucketInExcavator.z(),
+            #                         locRotationBucketInExcavator.w(), locRotationBucketInExcavator.x(), locRotationBucketInExcavator.y(), locRotationBucketInExcavator.z(),
+            #                         locRotationEABucketInExcavator.x(), locRotationEABucketInExcavator.y(), locRotationEABucketInExcavator.z()])
+            ###################################################################################          
+            # Frame Rock in Excavator
+            # Current model frame position, given in world coordinate frame.
+            positionRockInExcavator = frameRockInExcavator.getPosition()
+            
+            # Current model frame rotation, given in world coordinate frame.
+            rotationRockInExcavator = frameRockInExcavator.getRotation()
+            rotationEARockInExcavator = rotationRockInExcavator.getAsEulerAngles()
+            
+            # Returns the model frame containing model the transformation and utilities to manipulate position, rotation etc.
+            # getFrameRockInExcavator = frameRockInExcavator.getFrame()
+            
+            # the velocity of the ObserverFrame in the world
+            velocityRockInExcavator = frameRockInExcavator.getVelocity()
+            
+            # the angular velocity of the ObserverFrame in the world 
+            angVelocityRockInExcavator = frameRockInExcavator.getAngularVelocity()
+            
+            # the acceleration of the ObserverFrame in the world
+            accelerationRockInExcavator = frameRockInExcavator.getAcceleration()
+            
+            # the angular acceleration of the ObserverFrame in the world
+            angAccelerationRockInExcavator = frameRockInExcavator.getAngularAcceleration()
+            
+            # the relative translate to this frame's parent frame 
+            locPositionRockInExcavator = frameRockInExcavator.getLocalPosition()
+            
+            # the relative rotation to this frame's parent frame 
+            locRotationRockInExcavator = frameRockInExcavator.getLocalRotation()
+            locRotationEARockInExcavator = locRotationRockInExcavator.getAsEulerAngles()
+            
+            # the local transformation matrix (i.e., the transformation relative to the parent) 
+            # transformationRockInExcavator = frameRockInExcavator.getLocalTransform()
+            
+            # # Save Rock-Excavator's motion variables in csv file
+            # filename = os.path.join(folder_path, 'ObserverFrameRockExcavator.csv')
+            
+            # header = ['Time',
+            #         'positionRockInExcavator.x()', 'positionRockInExcavator.y()', 'positionRockInExcavator.z()',
+            #         'rotationRockInExcavator.w()', 'rotationRockInExcavator.x()', 'rotationRockInExcavator.y()', 'rotationRockInExcavator.z()',
+            #         'rotationEARockInExcavator.x()', 'rotationEARockInExcavator.y()', 'rotationEARockInExcavator.z()',
+            #         'velocityRockInExcavator.x()', 'velocityRockInExcavator.y()', 'velocityRockInExcavator.z()',
+            #         'angVelocityRockInExcavator.x()', 'angVelocityRockInExcavator.y()', 'angVelocityRockInExcavator.z()',
+            #         'accelerationRockInExcavator.x()', 'accelerationRockInExcavator.y()', 'accelerationRockInExcavator.z()',
+            #         'angAccelerationRockInExcavator.x()', 'angAccelerationRockInExcavator.y()', 'angAccelerationRockInExcavator.z()',
+            #         'locPositionRockInExcavator.x()', 'locPositionRockInExcavator.y()', 'locPositionRockInExcavator.z()',
+            #         'locRotationRockInExcavator.w()', 'locRotationRockInExcavator.x()', 'locRotationRockInExcavator.y()', 'locRotationRockInExcavator.z()',
+            #         'locRotationEARockInExcavator.x()', 'locRotationEARockInExcavator.y()', 'locRotationEARockInExcavator.z()']
+            
+            # if os.path.exists(filename) and simulation().getTimeStamp()<=0:
+            #     os.remove(filename)
+            # else:
+            #     with open(filename, mode='a', newline='') as file:
+            #         writer = csv.writer(file)
+                    
+            #         # Write the header only if the file is empty
+            #         if os.path.getsize(filename) == 0:
+            #             writer.writerow(header)
+                    
+            #         writer.writerow([simulation().getTimeStamp(),
+            #                         positionRockInExcavator.x(), positionRockInExcavator.y(), positionRockInExcavator.z(),
+            #                         rotationRockInExcavator.w(), rotationRockInExcavator.x(), rotationRockInExcavator.y(), rotationRockInExcavator.z(),
+            #                         rotationEARockInExcavator.x(), rotationEARockInExcavator.y(), rotationEARockInExcavator.z(),
+            #                         velocityRockInExcavator.x(), velocityRockInExcavator.y(), velocityRockInExcavator.z(),
+            #                         angVelocityRockInExcavator.x(), angVelocityRockInExcavator.y(), angVelocityRockInExcavator.z(),
+            #                         accelerationRockInExcavator.x(), accelerationRockInExcavator.y(), accelerationRockInExcavator.z(),
+            #                         angAccelerationRockInExcavator.x(), angAccelerationRockInExcavator.y(), angAccelerationRockInExcavator.z(),
+            #                         locPositionRockInExcavator.x(), locPositionRockInExcavator.y(), locPositionRockInExcavator.z(),
+            #                         locRotationRockInExcavator.w(), locRotationRockInExcavator.x(), locRotationRockInExcavator.y(), locRotationRockInExcavator.z(),
+            #                         locRotationEARockInExcavator.x(), locRotationEARockInExcavator.y(), locRotationEARockInExcavator.z()])
+                    
+            ###################################################################################
+            # Frame Rock in Bucket
+            # Get position of Rigid Body
+            positionRockInBucket = frameRockInBucket.getPosition()
+            
+            # Get orientation of Rigid Body
+            rotationRockInBucket = frameRockInBucket.getRotation()
+            rotationEARockInBucket = rotationRockInBucket.getAsEulerAngles()
+            
+            # Or the complete frame at one call (model frame of this rigid body)
+            getFrameRockInBucket = frameRockInBucket.getFrame()
+            
+            # Get the linear velocity 
+            velocityRockInBucket = frameRockInBucket.getVelocity()
+            
+            # Get the angular velocity 
+            angVelocityRockInBucket = frameRockInBucket.getAngularVelocity()
+            
+            # Get the linear acceleration as the difference in linear velocity between this and the previous time step
+            accelerationRockInBucket = frameRockInBucket.getAcceleration()
+            
+            # Get the angular acceleration as the difference in linear velocity between this and the previous time step
+            angAccelerationRockInBucket = frameRockInBucket.getAngularAcceleration()
+            
+            # the relative translate to this frame's parent frame 
+            locPositionRockInBucket = frameRockInBucket.getLocalPosition()
+            
+            # the relative rotation to this frame's parent frame 
+            locRotationRockInBucket = frameRockInBucket.getLocalRotation()
+            locRotationEARockInBucket = locRotationRockInBucket.getAsEulerAngles()
+            
+            # Get the the local transformation matrix of the body's model frame, relative to the parent
+            transformationRockInBucket = frameRockInBucket.getLocalTransform()
+            
+            # # Save Rock-Bucket's motion variables in csv file
+            # filename = os.path.join(folder_path, 'ObserverFrameRockBucket.csv')
+            
+            # header = ['Time',
+            #         'positionRockInBucket.x()', 'positionRockInBucket.y()', 'positionRockInBucket.z()',
+            #         'rotationRockInBucket.w()', 'rotationRockInBucket.x()', 'rotationRockInBucket.y()', 'rotationRockInBucket.z()',
+            #         'rotationEARockInBucket.x()', 'rotationEARockInBucket.y()', 'rotationEARockInBucket.z()',
+            #         'velocityRockInBucket.x()', 'velocityRockInBucket.y()', 'velocityRockInBucket.z()',
+            #         'angVelocityRockInBucket.x()', 'angVelocityRockInBucket.y()', 'angVelocityRockInBucket.z()',
+            #         'accelerationRockInBucket.x()', 'accelerationRockInBucket.y()', 'accelerationRockInBucket.z()',
+            #         'angAccelerationRockInBucket.x()', 'angAccelerationRockInBucket.y()', 'angAccelerationRockInBucket.z()',
+            #         'locPositionRockInBucket.x()', 'locPositionRockInBucket.y()', 'locPositionRockInBucket.z()',
+            #         'locRotationRockInBucket.w()', 'locRotationRockInBucket.x()'', locRotationRockInBucket.y()', 'locRotationRockInBucket.z()',
+            #         'locRotationEARockInBucket.x()', 'locRotationEARockInBucket.y()', 'locRotationEARockInBucket.z()']
+            
+            # if os.path.exists(filename) and simulation().getTimeStamp()<=0:
+            #     os.remove(filename)
+            # else:
+            #     with open(filename, mode='a', newline='') as file:
+            #         writer = csv.writer(file)
+                    
+            #         # Write the header only if the file is empty
+            #         if os.path.getsize(filename) == 0:
+            #             writer.writerow(header)
+                        
+            #         writer.writerow([simulation().getTimeStamp(),
+            #                         positionRockInBucket.x(), positionRockInBucket.y(), positionRockInBucket.z(),
+            #                         rotationRockInBucket.w(), rotationRockInBucket.x(), rotationRockInBucket.y(), rotationRockInBucket.z(),
+            #                         rotationEARockInBucket.x(), rotationEARockInBucket.y(), rotationEARockInBucket.z(),
+            #                         velocityRockInBucket.x(), velocityRockInBucket.y(), velocityRockInBucket.z(),
+            #                         angVelocityRockInBucket.x(), angVelocityRockInBucket.y(), angVelocityRockInBucket.z(),
+            #                         accelerationRockInBucket.x(), accelerationRockInBucket.y(), accelerationRockInBucket.z(),
+            #                         angAccelerationRockInBucket.x(), angAccelerationRockInBucket.y(), angAccelerationRockInBucket.z(),
+            #                         locPositionRockInBucket.x(), locPositionRockInBucket.y(), locPositionRockInBucket.z(),
+            #                         locRotationRockInBucket.w(), locRotationRockInBucket.x(), locRotationRockInBucket.y(), locRotationRockInBucket.z(),
+            #                         locRotationEARockInBucket.x(), locRotationEARockInBucket.y(), locRotationEARockInBucket.z()])
+                    
+            ###################################################################################
+            # Frame Rock in World
+            # Current model frame position, given in world coordinate frame.
+            positionRockInWorld = frameRockInWorld.getPosition()
+            
+            # Current model frame rotation, given in world coordinate frame.
+            rotationRockInWorld = frameRockInWorld.getRotation()
+            rotationEARockInWorld = rotationRockInWorld.getAsEulerAngles()
+            
+            # Returns the model frame containing model the transformation and utilities to manipulate position, rotation etc.
+            # getFrameRockInWorld = frameRockInWorld.getFrame()
+            
+            # the velocity of the ObserverFrame in the world
+            velocityRockInWorld = frameRockInWorld.getVelocity()
+            
+            # the angular velocity of the ObserverFrame in the world 
+            angVelocityRockInWorld = frameRockInWorld.getAngularVelocity()
+            
+            # the acceleration of the ObserverFrame in the world
+            accelerationRockInWorld = frameRockInWorld.getAcceleration()
+            
+            # the angular acceleration of the ObserverFrame in the world
+            angAccelerationRockInWorld = frameRockInWorld.getAngularAcceleration()
+            
+            # the relative translate to this frame's parent frame 
+            locPositionRockInWorld = frameRockInWorld.getLocalPosition()
+            
+            # the relative rotation to this frame's parent frame 
+            locRotationRockInWorld = frameRockInWorld.getLocalRotation()
+            locRotationEARockInWorld = locRotationRockInWorld.getAsEulerAngles()
+            
+            # the local transformation matrix (i.e., the transformation relative to the parent) 
+            # transformationRockInWorld = frameRockInWorld.getLocalTransform()
+            
+            # # Save Rock-World's motion variables in csv file
+            # filename = os.path.join(folder_path, 'ObserverFrameRockWorld.csv')
+            
+            # header = ['Time',
+            #         'positionRockInWorld.x()', 'positionRockInWorld.y()', 'positionRockInWorld.z()',
+            #         'rotationRockInWorld.w()', 'rotationRockInWorld.x()', 'rotationRockInWorld.y()', 'rotationRockInWorld.z()',
+            #         'rotationEARockInWorld.x()', 'rotationEARockInWorld.y()', 'rotationEARockInWorld.z()',
+            #         'velocityRockInWorld.x()', 'velocityRockInWorld.y()', 'velocityRockInWorld.z()',
+            #         'angVelocityRockInWorld.x()', 'angVelocityRockInWorld.y()', 'angVelocityRockInWorld.z()',
+            #         'accelerationRockInWorld.x()', 'accelerationRockInWorld.y()', 'accelerationRockInWorld.z()',
+            #         'angAccelerationRockInWorld.x()', 'angAccelerationRockInWorld.y()', 'angAccelerationRockInWorld.z()',
+            #         'locPositionRockInWorld.x()', 'locPositionRockInWorld.y()', 'locPositionRockInWorld.z()',
+            #         'locRotationRockInWorld.w()', 'locRotationRockInWorld.x()', 'locRotationRockInWorld.y()', 'locRotationRockInWorld.z()',
+            #         'locRotationEARockInWorld.x()', 'locRotationEARockInWorld.y()', 'locRotationEARockInWorld.z()']
+            
+            # if os.path.exists(filename) and simulation().getTimeStamp()<=0:
+            #     os.remove(filename)
+            # else:
+            #     with open(filename, mode='a', newline='') as file:
+            #         writer = csv.writer(file)
+                    
+            #         # Write the header only if the file is empty
+            #         if os.path.getsize(filename) == 0:
+            #             writer.writerow(header)
+                        
+            #         writer.writerow([simulation().getTimeStamp(),
+            #                         positionRockInWorld.x(), positionRockInWorld.y(), positionRockInWorld.z(),
+            #                         rotationRockInWorld.w(), rotationRockInWorld.x(), rotationRockInWorld.y(), rotationRockInWorld.z(),
+            #                         rotationEARockInWorld.x(), rotationEARockInWorld.y(), rotationEARockInWorld.z(),
+            #                         velocityRockInWorld.x(), velocityRockInWorld.y(), velocityRockInWorld.z(),
+            #                         angVelocityRockInWorld.x(), angVelocityRockInWorld.y(), angVelocityRockInWorld.z(),
+            #                         accelerationRockInWorld.x(), accelerationRockInWorld.y(), accelerationRockInWorld.z(),
+            #                         angAccelerationRockInWorld.x(), angAccelerationRockInWorld.y(), angAccelerationRockInWorld.z(),
+            #                         locPositionRockInWorld.x(), locPositionRockInWorld.y(), locPositionRockInWorld.z(),
+            #                         locRotationRockInWorld.w(), locRotationRockInWorld.x(), locRotationRockInWorld.y(), locRotationRockInWorld.z(),
+            #                         locRotationEARockInWorld.x(), locRotationEARockInWorld.y(), locRotationEARockInWorld.z()])
+                    
+            ###################################################################################
+            # Frame RockCM in World
+            # Current model frame position, given in world coordinate frame.
+            positionRockCMInWorld = frameRockCMInWorld.getPosition()
+            
+            # Current model frame rotation, given in world coordinate frame.
+            rotationRockCMInWorld = frameRockCMInWorld.getRotation()
+            rotationEARockCMInWorld = rotationRockCMInWorld.getAsEulerAngles()
+            
+            # Returns the model frame containing model the transformation and utilities to manipulate position, rotation etc. 
+            # getFrameRockCMInWorld = frameRockCMInWorld.getFrame()
+            
+            # the velocity of the ObserverFrame in the world 
+            velocityRockCMInWorld = frameRockCMInWorld.getVelocity()
+            
+            # the angular velocity of the ObserverFrame in the world 
+            angVelocityRockCMInWorld = frameRockCMInWorld.getAngularVelocity()
+            
+            # the acceleration of the ObserverFrame in the world
+            accelerationRockCMInWorld = frameRockCMInWorld.getAcceleration()
+            
+            # the angular acceleration of the ObserverFrame in the world
+            angAccelerationRockCMInWorld = frameRockCMInWorld.getAngularAcceleration()
+            
+            # the relative translate to this frame's parent frame 
+            locPositionRockCMInWorld = frameRockCMInWorld.getLocalPosition()
+            
+            # the relative rotation to this frame's parent frame 
+            locRotationRockCMInWorld = frameRockCMInWorld.getLocalRotation()
+            locRotationEARockCMInWorld = locRotationRockCMInWorld.getAsEulerAngles()
+            
+            # the local transformation matrix (i.e., the transformation relative to the parent) 
+            # transformationRockCMInWorld = frameRockCMInWorld.getLocalTransform()
+            
+            # # Save RockCM-World's motion variables in csv file
+            # filename = os.path.join(folder_path, 'ObserverFrameRockCMWorld.csv')
+            
+            # header = ['Time',
+            #         'positionRockCMInWorld.x()', 'positionRockCMInWorld.y()', 'positionRockCMInWorld.z()',
+            #         'rotationRockCMInWorld.w()', 'rotationRockCMInWorld.x()', 'rotationRockCMInWorld.y()', 'rotationRockCMInWorld.z()',
+            #         'rotationEARockCMInWorld.x()', 'rotationEARockCMInWorld.y()', 'rotationEARockCMInWorld.z()',
+            #         'velocityRockCMInWorld.x()', 'velocityRockCMInWorld.y()', 'velocityRockCMInWorld.z()',
+            #         'angVelocityRockCMInWorld.x()', 'angVelocityRockCMInWorld.y()', 'angVelocityRockCMInWorld.z()',
+            #         'accelerationRockCMInWorld.x()', 'accelerationRockCMInWorld.y()', 'accelerationRockCMInWorld.z()',
+            #         'angAccelerationRockCMInWorld.x()', 'angAccelerationRockCMInWorld.y()', 'angAccelerationRockCMInWorld.z()',
+            #         'locPositionRockCMInWorld.x()', 'locPositionRockCMInWorld.y()', 'locPositionRockCMInWorld.z()',
+            #         'locRotationRockCMInWorld.w()', 'locRotationRockCMInWorld.x()', 'locRotationRockCMInWorld.y()', 'locRotationRockCMInWorld.z()',
+            #         'locRotationEARockCMInWorld.x()', 'locRotationEARockCMInWorld.y()', 'locRotationEARockCMInWorld.z()']
+            
+            # if os.path.exists(filename) and simulation().getTimeStamp()<=0:
+            #     os.remove(filename)
+            # else:
+            #     with open(filename, mode='a', newline='') as file:
+            #         writer = csv.writer(file)
+                    
+            #         if os.path.getsize(filename) == 0:
+            #             writer.writerow(header)
+                    
+            #         writer.writerow([simulation().getTimeStamp(),
+            #                         positionRockCMInWorld.x(), positionRockCMInWorld.y(), positionRockCMInWorld.z(),
+            #                         rotationRockCMInWorld.w(), rotationRockCMInWorld.x(), rotationRockCMInWorld.y(), rotationRockCMInWorld.z(),
+            #                         rotationEARockCMInWorld.x(), rotationEARockCMInWorld.y(), rotationEARockCMInWorld.z(),
+            #                         velocityRockCMInWorld.x(), velocityRockCMInWorld.y(), velocityRockCMInWorld.z(),
+            #                         angVelocityRockCMInWorld.x(), angVelocityRockCMInWorld.y(), angVelocityRockCMInWorld.z(),
+            #                         accelerationRockCMInWorld.x(), accelerationRockCMInWorld.y(), accelerationRockCMInWorld.z(),
+            #                         angAccelerationRockCMInWorld.x(), angAccelerationRockCMInWorld.y(), angAccelerationRockCMInWorld.z(),
+            #                         locPositionRockCMInWorld.x(), locPositionRockCMInWorld.y(), locPositionRockCMInWorld.z(),
+            #                         locRotationRockCMInWorld.w(), locRotationRockCMInWorld.x(), locRotationRockCMInWorld.y(), locRotationRockCMInWorld.z(),
+            #                         locRotationEARockCMInWorld.x(), locRotationEARockCMInWorld.y(), locRotationEARockCMInWorld.z()])
+                    
+            ###################################################################################
+            # Frame Bucket in World
+            # Current model frame position, given in world coordinate frame. 
+            positionBucketInWorld = frameBucketInWorld.getPosition()
+            
+            # Current model frame rotation, given in world coordinate frame. 
+            rotationBucketInWorld = frameBucketInWorld.getRotation()
+            rotationEABucketInWorld = rotationBucketInWorld.getAsEulerAngles()
+            
+            # Returns the model frame containing model the transformation and utilities to manipulate position, rotation etc. 
+            # getFrameBucketInWorld = frameBucketInWorld.getFrame()
+            
+            # the velocity of the ObserverFrame in the world 
+            velocityBucketInWorld = frameBucketInWorld.getVelocity()
+            
+            # the angular velocity of the ObserverFrame in the world 
+            angVelocityBucketInWorld = frameBucketInWorld.getAngularVelocity()
+            
+            # the acceleration of the ObserverFrame in the world
+            accelerationBucketInWorld = frameBucketInWorld.getAcceleration()
+            
+            # the angular acceleration of the ObserverFrame in the world
+            angAccelerationBucketInWorld = frameBucketInWorld.getAngularAcceleration()
+            
+            # the relative translate to this frame's parent frame 
+            locPositionBucketInWorld = frameBucketInWorld.getLocalPosition()
+            
+            # the relative rotation to this frame's parent frame 
+            locRotationBucketInWorld = frameBucketInWorld.getLocalRotation()
+            locRotationEABucketInWorld = locRotationBucketInWorld.getAsEulerAngles()
+            
+            # the local transformation matrix (i.e., the transformation relative to the parent) 
+            # transformationBucketInWorld = frameBucketInWorld.getLocalTransform()
+            
+            # # Save Bucket-World's motion variables in csv file
+            # filename = os.path.join(folder_path, 'ObserverFrameBucketWorld.csv')
+            
+            # header = ['Time',
+            #         'positionBucketInWorld.x()', 'positionBucketInWorld.y()', 'positionBucketInWorld.z()',
+            #         'rotationBucketInWorld.w()', 'rotationBucketInWorld.x()', 'rotationBucketInWorld.y()', 'rotationBucketInWorld.z()',
+            #         'rotationEABucketInWorld.x()', 'rotationEABucketInWorld.y()', 'rotationEABucketInWorld.z()',
+            #         'velocityBucketInWorld.x()', 'velocityBucketInWorld.y()', 'velocityBucketInWorld.z()',
+            #         'angVelocityBucketInWorld.x()', 'angVelocityBucketInWorld.y()', 'angVelocityBucketInWorld.z()',
+            #         'accelerationBucketInWorld.x()', 'accelerationBucketInWorld.y()', 'accelerationBucketInWorld.z()',
+            #         'angAccelerationBucketInWorld.x()', 'angAccelerationBucketInWorld.y()', 'angAccelerationBucketInWorld.z()',
+            #         'locPositionBucketInWorld.x()', 'locPositionBucketInWorld.y()', 'locPositionBucketInWorld.z()',
+            #         'locRotationBucketInWorld.w()', 'locRotationBucketInWorld.x()', 'locRotationBucketInWorld.y()', 'locRotationBucketInWorld.z()',
+            #         'locRotationEABucketInWorld.x()', 'locRotationEABucketInWorld.y()', 'locRotationEABucketInWorld.z()']
+            
+            # if os.path.exists(filename) and simulation().getTimeStamp()<=0:
+            #     os.remove(filename)
+            # else:
+            #     with open(filename, mode='a', newline='') as file:
+            #         writer = csv.writer(file)
+                    
+            #         if os.path.getsize(filename) == 0:
+            #             writer.writerow(header)
+                    
+            #         writer.writerow([simulation().getTimeStamp(),
+            #                         positionBucketInWorld.x(), positionBucketInWorld.y(), positionBucketInWorld.z(),
+            #                         rotationBucketInWorld.w(), rotationBucketInWorld.x(), rotationBucketInWorld.y(), rotationBucketInWorld.z(),
+            #                         rotationEABucketInWorld.x(), rotationEABucketInWorld.y(), rotationEABucketInWorld.z(),
+            #                         velocityBucketInWorld.x(), velocityBucketInWorld.y(), velocityBucketInWorld.z(),
+            #                         angVelocityBucketInWorld.x(), angVelocityBucketInWorld.y(), angVelocityBucketInWorld.z(),
+            #                         accelerationBucketInWorld.x(), accelerationBucketInWorld.y(), accelerationBucketInWorld.z(),
+            #                         angAccelerationBucketInWorld.x(), angAccelerationBucketInWorld.y(), angAccelerationBucketInWorld.z(),
+            #                         locPositionBucketInWorld.x(), locPositionBucketInWorld.y(), locPositionBucketInWorld.z(),
+            #                         locRotationBucketInWorld.w(), locRotationBucketInWorld.x(), locRotationBucketInWorld.y(), locRotationBucketInWorld.z(),
+            #                         locRotationEABucketInWorld.x(), locRotationEABucketInWorld.y(), locRotationEABucketInWorld.z()])
+                    
+            ###################################################################################
+            # Bucket(CM)-World motion variables 2
+            # the center of mass position in world coordinate frame 
+            positionBucketCMInWorld2 = Bucket_body_obj.getCmPosition()
+            
+            # the center of mass rotation in world coordinate frame 
+            rotationBucketCMInWorld2 = Bucket_body_obj.getCmRotation()
+            rotationEABucketCMInWorld2 = rotationBucketCMInWorld2.getAsEulerAngles()
+            
+            # the center of mass transform in world coordinate frame 
+            # transformationBucketCMInWorld2 = Bucket_body_obj.getCmTransform()
+            
+            # Return the center of mass (CM) frame of this rigid body. 
+            # getFrameBucketCMInWorld2 = Bucket_body_obj.getCmFrame()
+            # locTranslationBucketCMInWorld2 = Bucket_body_obj.getCmFrame().getLocalTranslate()
+            
+            # the local offset of the center of mass position to the model origin (in model frame coordinates). 
+            locTranslationBucketCMInModel2 = Bucket_body_obj.getCmLocalTranslate()
+            
+            # the current model frame position, given in world coordinate frame 
+            positionBucketInWorld2 = Bucket_body_obj.getPosition()
+            
+            # Current model frame rotation, given in world coordinate frame. 
+            rotationBucketInWorld2 = Bucket_body_obj.getRotation()
+            rotationEABucketInWorld2 = rotationBucketInWorld2.getAsEulerAngles()
+            
+            # the current model transformation of this rigid body, given in world coordinate frame 
+            # transformationBucketInWorld2 = Bucket_body_obj.getTransform()
+            
+            # Returns the model frame containing model the transformation and utilities to manipulate position, rotation etc. 
+            # getFrameBucketInWorld2 = Bucket_body_obj.getFrame()
+            # locTranslationBucketInWorld2 = Bucket_body_obj.getFrame().getLocalTranslate()
+            
+            # the relative translate to the parent frame of the body's model frame. 
+            locPositionBucketInExcavator2 = Bucket_body_obj.getLocalPosition()
+            
+            # the body's rotation relative to its model frame's parent frame. 
+            locRotationBucketInExcavator2 = Bucket_body_obj.getLocalRotation()
+            locRotationEABucketInExcavator2 = locRotationBucketInExcavator2.getAsEulerAngles()
+            
+            # the local transformation matrix of the body's model frame, relative to the parent. 
+            # locTransformationBucketInExcavator2 = Bucket_body_obj.getLocalTransform()
+            
+            # linear velocity of the center of mass frame origin, in world coordinate frame 
+            velocityBucketInWorld2 = Bucket_body_obj.getVelocity()
+            
+            # angular velocity in world coordinate frame 
+            angVelocityBucketInWorld2 = Bucket_body_obj.getAngularVelocity()
+            
+            # the linear acceleration as the difference in linear velocity between this and the previous time step 
+            accelerationBucketInWorld2 = Bucket_body_obj.getAcceleration()
+            
+            # the angular acceleration as the difference in linear velocity between this and the previous time step 
+            angAccelerationBucketInWorld2 = Bucket_body_obj.getAngularAcceleration()
+            
+            # the current external force applied to the body using the method(s) add/setForce 
+            extForceBucketInWorld2 = Bucket_body_obj.getForce()
+            
+            # the linear momentum for this body 
+            momentumBucketInWorld2 = Bucket_body_obj.getLinearMomentum()
+            
+            # the angular momentum for this body 
+            angMomentumBucketInWorld2 = Bucket_body_obj.getAngularMomentum()
+            
+            # # Save Bucket-World's motion variables in csv file
+            # filename = os.path.join(folder_path, 'BucketWorld.csv')
+            
+            # header = ['Time',
+            #         'positionBucketCMInWorld.x()', 'positionBucketCMInWorld.y()', 'positionBucketCMInWorld.z()',
+            #         'rotationBucketCMInWorld.w()', 'rotationBucketCMInWorld.x()', 'rotationBucketCMInWorld.y()', 'rotationBucketCMInWorld.z()',
+            #         'rotationEABucketCMInWorld.x()', 'rotationEABucketCMInWorld.y()', 'rotationEABucketCMInWorld.z()',
+            #         'locTranslationBucketCMInModel.x()', 'locTranslationBucketCMInModel.y()', 'locTranslationBucketCMInModel.z()',
+            #         'positionBucketInWorld.x()', 'positionBucketInWorld.y()', 'positionBucketInWorld.z()', 
+            #         'rotationBucketInWorld.w()', 'rotationBucketInWorld.x()', 'rotationBucketInWorld.y()', 'rotationBucketInWorld.z()',
+            #         'rotationEABucketInWorld.x()', 'rotationEABucketInWorld.y()', 'rotationEABucketInWorld.z()',
+            #         'locPositionBucketInExcavator.x()', 'locPositionBucketInExcavator.y()', 'locPositionBucketInExcavator.z()',
+            #         'locRotationBucketInExcavator.w()', 'locRotationBucketInExcavator.x()', 'locRotationBucketInExcavator.y()', 'locRotationBucketInExcavator.z()',
+            #         'locRotationEABucketInExcavator.x()', 'locRotationEABucketInExcavator.y()', 'locRotationEABucketInExcavator.z()',
+            #         'velocityBucketInWorld.x()', 'velocityBucketInWorld.y()', 'velocityBucketInWorld.z()',
+            #         'angVelocityBucketInWorld.x()', 'angVelocityBucketInWorld.y()', 'angVelocityBucketInWorld.z()',
+            #         'accelerationBucketInWorld.x()', 'accelerationBucketInWorld.y()', 'accelerationBucketInWorld.z()',
+            #         'angAccelerationBucketInWorld.x()', 'angAccelerationBucketInWorld.y()', 'angAccelerationBucketInWorld.z()',
+            #         'momentumBucketInWorld.x()', 'momentumBucketInWorld.y()', 'momentumBucketInWorld.z()',
+            #         'angMomentumBucketInWorld.x()', 'angMomentumBucketInWorld.y()', 'angMomentumBucketInWorld.z()',
+            #         'extForceBucketInWorld.x()', 'extForceBucketInWorld.y()', 'extForceBucketInWorld.z()']
+            
+            # if os.path.exists(filename) and simulation().getTimeStamp()<=0:
+            #     os.remove(filename)
+            # else:
+            #     with open(filename, mode='a', newline='') as file:
+            #         writer = csv.writer(file)
+                    
+            #         if os.path.getsize(filename) == 0:
+            #             writer.writerow(header)
+                    
+            #         writer.writerow([simulation().getTimeStamp(),
+            #                         positionBucketCMInWorld2.x(), positionBucketCMInWorld2.y(), positionBucketCMInWorld2.z(),
+            #                         rotationBucketCMInWorld2.w(), rotationBucketCMInWorld2.x(), rotationBucketCMInWorld2.y(), rotationBucketCMInWorld2.z(),
+            #                         rotationEABucketCMInWorld2.x(), rotationEABucketCMInWorld2.y(), rotationEABucketCMInWorld2.z(),
+            #                         locTranslationBucketCMInModel2.x(), locTranslationBucketCMInModel2.y(), locTranslationBucketCMInModel2.z(),
+            #                         positionBucketInWorld2.x(), positionBucketInWorld2.y(), positionBucketInWorld2.z(), 
+            #                         rotationBucketInWorld2.w(), rotationBucketInWorld2.x(), rotationBucketInWorld2.y(), rotationBucketInWorld2.z(),
+            #                         rotationEABucketInWorld2.x(), rotationEABucketInWorld2.y(), rotationEABucketInWorld2.z(),
+            #                         locPositionBucketInExcavator2.x(), locPositionBucketInExcavator2.y(), locPositionBucketInExcavator2.z(),
+            #                         locRotationBucketInExcavator2.w(), locRotationBucketInExcavator2.x(), locRotationBucketInExcavator2.y(), locRotationBucketInExcavator2.z(),
+            #                         locRotationEABucketInExcavator2.x(), locRotationEABucketInExcavator2.y(), locRotationEABucketInExcavator2.z(),
+            #                         velocityBucketInWorld2.x(), velocityBucketInWorld2.y(), velocityBucketInWorld2.z(),
+            #                         angVelocityBucketInWorld2.x(), angVelocityBucketInWorld2.y(), angVelocityBucketInWorld2.z(),
+            #                         accelerationBucketInWorld2.x(), accelerationBucketInWorld2.y(), accelerationBucketInWorld2.z(),
+            #                         angAccelerationBucketInWorld2.x(), angAccelerationBucketInWorld2.y(), angAccelerationBucketInWorld2.z(),
+            #                         momentumBucketInWorld2.x(), momentumBucketInWorld2.y(), momentumBucketInWorld2.z(),
+            #                         angMomentumBucketInWorld2.x(), angMomentumBucketInWorld2.y(), angMomentumBucketInWorld2.z(),
+            #                         extForceBucketInWorld2.x(), extForceBucketInWorld2.y(), extForceBucketInWorld2.z()])
+                    
+            ###################################################################################
+            # Rock(CM)-World motion variables 2
+            # the center of mass position in world coordinate frame 
+            positionRockCMInWorld2 = rock.getCmPosition()
+            
+            # the center of mass rotation in world coordinate frame 
+            rotationRockCMInWorld2 = rock.getCmRotation()
+            rotationEARockCMInWorld2 = rotationRockCMInWorld2.getAsEulerAngles()
+            
+            # the center of mass transform in world coordinate frame
+            # transformationRockCMInWorld2 = rock.getCmTransform()
+            
+            # Return the center of mass (CM) frame of this rigid body. 
+            # getFrameRockCMInWorld2 = rock.getCmFrame()
+            # locTranslationRockCMInWorld2 = rock.getCmFrame().getLocalTranslate()
+            
+            # the local offset of the center of mass position to the model origin (in model frame coordinates). 
+            locTranslationRockCMInModel2 = rock.getCmLocalTranslate()
+
+            # the current model frame position, given in world coordinate frame 
+            positionRockInWorld2 = rock.getPosition()
+            
+            # Current model frame rotation, given in world coordinate frame. 
+            rotationRockInWorld2 = rock.getRotation()
+            rotationEARockInWorld2 = rotationRockInWorld2.getAsEulerAngles()
+
+            # the current model transformation of this rigid body, given in world coordinate frame 
+            # transformationRockInWorld2 = rock.getTransform()
+
+            # Returns the model frame containing model the transformation and utilities to manipulate position, rotation etc. 
+            # getFrameRockInWorld2 = rock.getFrame()
+            # locTranslationRockInWorld2 = rock.getFrame().getLocalTranslate()
+            
+            # the relative translate to the parent frame of the body's model frame. 
+            locPositionRockInWorld2 = rock.getLocalPosition()
+            
+            # the body's rotation relative to its model frame's parent frame. 
+            locRotationRockInWorld2 = rock.getLocalRotation()
+            locRotationEARockInWorld2 = locRotationRockInWorld2.getAsEulerAngles()
+            
+            # the local transformation matrix of the body's model frame, relative to the parent. 
+            # locTransformationRockInWorld2 = rock.getLocalTransform()
+            
+            # linear velocity of the center of mass frame origin, in world coordinate frame 
+            velocityRockCMInWorld2 = rock.getVelocity()
+            
+            # angular velocity in world coordinate frame 
+            angVelocityRockInWorld2 = rock.getAngularVelocity()
+            
+            # the linear acceleration as the difference in linear velocity between this and the previous time step 
+            accelerationRockCMInWorld2 = rock.getAcceleration()
+            
+            # the angular acceleration as the difference in linear velocity between this and the previous time step 
+            angAccelerationRockInWorld2 = rock.getAngularAcceleration()
+            
+            # the current external force applied to the body using the method(s) add/setForce 
+            extForceRockInWorld2 = rock.getForce()
+            
+            # the linear momentum for this body 
+            momentumRockInWorld2 = rock.getLinearMomentum()
+            
+            # the angular momentum for this body 
+            angMomentumRockInWorld2 = rock.getAngularMomentum()
+            
+            # # Save Bucket-World's motion variables in csv file
+            # filename = os.path.join(folder_path, 'RockWorld.csv')
+            
+            # header = ['Time',
+            #         'positionRockCMInWorld.x()', 'positionRockCMInWorld.y()', 'positionRockCMInWorld.z()',
+            #         'rotationRockCMInWorld.w()', 'rotationRockCMInWorld.x()', 'rotationRockCMInWorld.y()', 'rotationRockCMInWorld.z()',
+            #         'rotationEARockCMInWorld.x()', 'rotationEARockCMInWorld.y()', 'rotationEARockCMInWorld.z()',
+            #         'locTranslationRockCMInModel.x()', 'locTranslationRockCMInModel.y()', 'locTranslationRockCMInModel.z()',
+            #         'positionRockInWorld.x()', 'positionRockInWorld.y()', 'positionRockInWorld.z()', 
+            #         'rotationRockInWorld.w()', 'rotationRockInWorld.x()', 'rotationRockInWorld.y()', 'rotationRockInWorld.z()',
+            #         'rotationEARockInWorld.x()', 'rotationEARockInWorld.y()', 'rotationEARockInWorld.z()',
+            #         'locPositionRockInWorld.x()', 'locPositionRockInWorld.y()', 'locPositionRockInWorld.z()',
+            #         'locRotationRockInWorld.w()', 'locRotationRockInWorld.x()', 'locRotationRockInWorld.y()', 'locRotationRockInWorld.z()',
+            #         'locRotationEARockInWorld.x()', 'locRotationEARockInWorld.y()', 'locRotationEARockInWorld.z()',
+            #         'velocityRockCMInWorld.x()', 'velocityRockCMInWorld.y()', 'velocityRockCMInWorld.z()',
+            #         'angVelocityRockInWorld.x()', 'angVelocityRockInWorld.y()', 'angVelocityRockInWorld.z()',
+            #         'accelerationRockCMInWorld.x()', 'accelerationRockCMInWorld.y()', 'accelerationRockCMInWorld.z()',
+            #         'angAccelerationRockInWorld.x()', 'angAccelerationRockInWorld.y()', 'angAccelerationRockInWorld.z()',
+            #         'momentumRockInWorld.x()', 'momentumRockInWorld.y()', 'momentumRockInWorld.z()',
+            #         'angMomentumRockInWorld.x()', 'angMomentumRockInWorld.y()', 'angMomentumRockInWorld.z()',
+            #         'extForceRockInWorld.x()', 'extForceRockInWorld.y()', 'extForceRockInWorld.z()']
+            
+            # if os.path.exists(filename) and simulation().getTimeStamp()<=0:
+            #     os.remove(filename) 
+            # else:
+            #     with open(filename, mode='a', newline='') as file:
+            #         writer = csv.writer(file)
+                    
+            #         if os.path.getsize(filename) == 0:
+            #             writer.writerow(header)
+                    
+            #         writer.writerow([simulation().getTimeStamp(),
+            #                         positionRockCMInWorld2.x(), positionRockCMInWorld2.y(), positionRockCMInWorld2.z(),
+            #                         rotationRockCMInWorld2.w(), rotationRockCMInWorld2.x(), rotationRockCMInWorld2.y(), rotationRockCMInWorld2.z(),
+            #                         rotationEARockCMInWorld2.x(), rotationEARockCMInWorld2.y(), rotationEARockCMInWorld2.z(),
+            #                         locTranslationRockCMInModel2.x(), locTranslationRockCMInModel2.y(), locTranslationRockCMInModel2.z(),
+            #                         positionRockInWorld2.x(), positionRockInWorld2.y(), positionRockInWorld2.z(), 
+            #                         rotationRockInWorld2.w(), rotationRockInWorld2.x(), rotationRockInWorld2.y(), rotationRockInWorld2.z(),
+            #                         rotationEARockInWorld2.x(), rotationEARockInWorld2.y(), rotationEARockInWorld2.z(),
+            #                         locPositionRockInWorld2.x(), locPositionRockInWorld2.y(), locPositionRockInWorld2.z(),
+            #                         locRotationRockInWorld2.w(), locRotationRockInWorld2.x(), locRotationRockInWorld2.y(), locRotationRockInWorld2.z(),
+            #                         locRotationEARockInWorld2.x(), locRotationEARockInWorld2.y(), locRotationEARockInWorld2.z(),
+            #                         velocityRockCMInWorld2.x(), velocityRockCMInWorld2.y(), velocityRockCMInWorld2.z(),
+            #                         angVelocityRockInWorld2.x(), angVelocityRockInWorld2.y(), angVelocityRockInWorld2.z(),
+            #                         accelerationRockCMInWorld2.x(), accelerationRockCMInWorld2.y(), accelerationRockCMInWorld2.z(),
+            #                         angAccelerationRockInWorld2.x(), angAccelerationRockInWorld2.y(), angAccelerationRockInWorld2.z(),
+            #                         momentumRockInWorld2.x(), momentumRockInWorld2.y(), momentumRockInWorld2.z(),
+            #                         angMomentumRockInWorld2.x(), angMomentumRockInWorld2.y(), angMomentumRockInWorld2.z(),
+            #                         extForceRockInWorld2.x(), extForceRockInWorld2.y(), extForceRockInWorld2.z()])
+                    
+            ################################################################################### 
+            # Bucket and rock's motion variables
+            # Get position of Center of Mass in world coordinate system
+            pos_cm = Bucket_body_obj.getCmPosition()
+            pos_cm_rock = rock.getCmPosition()
+
+            # Get orientation of Center of Mass in world coordinate system
+            rot_cm = Bucket_body_obj.getCmRotation()
+            rot_cm_EA = rot_cm.getAsEulerAngles()
+            
+            rot_cm_rock = rock.getCmRotation()
+            rot_cm_rock_EA = rot_cm_rock.getAsEulerAngles()
+            
+            # Get rotation and translation of Center of Mass in world coordinate system
+            trans_rot_cm = Bucket_body_obj.getCmTransform()
+            trans_rot_cm_rock = rock.getCmTransform()
+
+            # Or the complete frame at one call
+            frame_cm = Bucket_body_obj.getCmFrame()
+            frame_cm_rock = rock.getCmFrame()
+
+            # Translation relative to model coordinate system
+            trans_local = Bucket_body_obj.getCmFrame().getLocalTranslate()
+            trans_local_rock = rock.getCmFrame().getLocalTranslate()
+            # Get the local offset of the center of mass position to the model origin (in model frame coordinates)
+            trans_local_cm = Bucket_body_obj.getCmLocalTranslate()
+            trans_local_cm_rock = rock.getCmLocalTranslate()
+
+            # Get position of Rigid Body in world coordinate system (the current model frame position, given in world coordinate frame)
+            pos_model = Bucket_body_obj.getPosition()
+            pos_model_rock = rock.getPosition()
+
+            # Get orientation of Rigid Body in world coordinate system (the current model frame rotation, given in world coordinate frame)
+            rot_model = Bucket_body_obj.getRotation()
+            rot_model_EA = rot_model.getAsEulerAngles()
+            
+            rot_model_rock = rock.getRotation()
+            rot_model_rock_EA = rot_model_rock.getAsEulerAngles()
+
+            # Get rotation and translation of Rigid Body in world coordinate system (the current model transformation of this rigid body, given in world coordinate frame)
+            trans_rot_model = Bucket_body_obj.getTransform()
+            trans_rot_model_rock = rock.getTransform()
+
+            # Or the complete frame at one call (model frame of this rigid body)
+            frame_model = Bucket_body_obj.getFrame()
+            frame_model_rock = rock.getFrame()
+            
+            # Translation relative to model coordinate system
+            trans_local_v2 = Bucket_body_obj.getFrame().getLocalTranslate()
+            trans_local_rock_v2 = rock.getFrame().getLocalTranslate()
+            
+            # Get the relative translate to the parent frame of the body's model frame
+            pos_loc = Bucket_body_obj.getLocalPosition()
+            pos_loc_rock = rock.getLocalPosition()
+            
+            # Get the body's rotation relative to its model frame's parent frame
+            rot_loc = Bucket_body_obj.getLocalRotation()
+            rot_loc_EA = rot_loc.getAsEulerAngles()
+            rot_loc_rock = rock.getLocalRotation()
+            rot_loc_rock_EA = rot_loc_rock.getAsEulerAngles()
+            
+            # Get the the local transformation matrix of the body's model frame, relative to the parent
+            trans_rot_loc = Bucket_body_obj.getLocalTransform()
+            trans_rot_loc_rock = rock.getLocalTransform()
+            
+            ###################################################################################
+            # Get the linear velocity of the center of mass frame origin, in world coordinate frame
+            vel_model = Bucket_body_obj.getVelocity()
+            vel_model_rock = rock.getVelocity()
+            
+            # Get the angular velocity in world coordinate frame
+            ang_vel_model = Bucket_body_obj.getAngularVelocity()
+            ang_vel_model_rock = rock.getAngularVelocity()
+            
+            # Get the linear acceleration as the difference in linear velocity between this and the previous time step
+            acc_model = Bucket_body_obj.getAcceleration()
+            acc_model_rock = rock.getAcceleration()
+            
+            # Get the angular acceleration as the difference in linear velocity between this and the previous time step
+            ang_acc_model = Bucket_body_obj.getAngularAcceleration()
+            ang_acc_model_rock = rock.getAngularAcceleration()
+            
+            # Get the current external force applied to the body using the method(s) add/setForce
+            ext_force = Bucket_body_obj.getForce()
+            ext_force_rock = rock.getForce()
+            
+            # Get the linear momentum for this body
+            mom_model = Bucket_body_obj.getLinearMomentum()
+            mom_model_rock = rock.getLinearMomentum()
+            
+            # Get the angular momentum for this body
+            ang_mom_model = Bucket_body_obj.getAngularMomentum()
+            ang_mom_model_rock = rock.getAngularMomentum()
+            
+            ###################################################################################
+            # # Save bucket's motion variables in csv file
+            # filename = os.path.join(folder_path, 'Bucket_Excavator365_Variables.csv')
+            
+            # header = ['Time',
+            #         'BucExcPos X', 'BucExcPos Y', 'BucExcPos Z',
+            #         'BucExcLocPos X', 'BucExcLocPos Y', 'BucExcLocPos Z',
+            #         'pos_cm X', 'pos_cm Y', 'pos_cm Z',
+            #         'rot_cm W', 'rot_cm X', 'rot_cm Y', 'rot_cm Z',
+            #         'rot_cm_EA X', 'rot_cm_EA Y', 'rot_cm_EA Z',
+            #         'trans_local X', 'trans_local Y', 'trans_local Z',
+            #         'trans_local_cm X', 'trans_local_cm Y', 'trans_local_cm Z',
+            #         'pos_model X', 'pos_model Y', 'pos_model Z',
+            #         'rot_model W', 'rot_model X', 'rot_model Y', 'rot_model Z',
+            #         'rot_model_EA X', 'rot_model_EA Y', 'rot_model_EA Z',
+            #         'vel_model X', 'vel_model Y', 'vel_model Z',
+            #         'ang_vel_model X', 'ang_vel_model Y', 'ang_vel_model Z',
+            #         'acc_model X', 'acc_model Y', 'acc_model Z',
+            #         'ang_acc_model X', 'ang_acc_model Y', 'ang_acc_model Z',
+            #         'pos_loc X', 'pos_loc Y', 'pos_loc Z',
+            #         'rot_loc W', 'rot_loc X', 'rot_loc Y', 'rot_loc Z',
+            #         'rot_loc_EA X', 'rot_loc_EA Y', 'rot_loc_EA Z',
+            #         'mom_model X', 'mom_model Y', 'mom_model Z',
+            #         'ang_mom_model X', 'ang_mom_model Y', 'ang_mom_model Z',
+            #         'ext_force X', 'ext_force Y', 'ext_force Z']
+            
+            # if os.path.exists(filename) and simulation().getTimeStamp()<=0:
+            #     os.remove(filename)
+            # else:
+            #     with open(filename, mode='a', newline='') as file:
+            #         writer = csv.writer(file)
+                    
+            #         if os.path.getsize(filename) == 0:
+            #             writer.writerow(header)
+                    
+            #         writer.writerow([simulation().getTimeStamp(),
+            #                         pos_cm.x(), pos_cm.y(), pos_cm.z(),
+            #                         rot_cm.w(), rot_cm.x(), rot_cm.y(), rot_cm.z(),
+            #                         rot_cm_EA.x(), rot_cm_EA.y(), rot_cm_EA.z(),
+            #                         trans_local.x(), trans_local.y(), trans_local.z(),
+            #                         trans_local_cm.x(), trans_local_cm.y(), trans_local_cm.z(),
+            #                         pos_model.x(), pos_model.y(), pos_model.z(),
+            #                         rot_model.w(), rot_model.x(), rot_model.y(), rot_model.z(),
+            #                         rot_model_EA.x(), rot_model_EA.y(), rot_model_EA.z(),
+            #                         vel_model.x(), vel_model.y(), vel_model.z(),
+            #                         ang_vel_model.x(), ang_vel_model.y(), ang_vel_model.z(),
+            #                         acc_model.x(), acc_model.y(), acc_model.z(),
+            #                         ang_acc_model.x(), ang_acc_model.y(), ang_acc_model.z(),
+            #                         pos_loc.x(), pos_loc.y(), pos_loc.z(),
+            #                         rot_loc.w(), rot_loc.x(), rot_loc.y(), rot_loc.z(),
+            #                         rot_loc_EA.x(), rot_loc_EA.y(), rot_loc_EA.z(),
+            #                         mom_model.x(), mom_model.y(), mom_model.z(),
+            #                         ang_mom_model.x(), ang_mom_model.y(), ang_mom_model.z(),
+            #                         ext_force.x(), ext_force.y(), ext_force.z()])
+            
+            
+            # ###################################################################################
+            # # Save Rock's motion variables in csv file
+            # filename = os.path.join(folder_path, 'Rock_Excavator365_Variables.csv')
+            
+            # header = ['Time',
+            #         'pos_cm_rock X', 'pos_cm_rock Y', 'pos_cm_rock Z',
+            #         'rot_cm_rock W', 'rot_cm_rock X', 'rot_cm_rock Y', 'rot_cm_rock Z',
+            #         'rot_cm_rock_EA X', 'rot_cm_rock_EA Y', 'rot_cm_rock_EA Z',
+            #         'trans_local_rock X', 'trans_local_rock Y', 'trans_local_rock Z',
+            #         'trans_local_cm_rock X', 'trans_local_cm_rock Y', 'trans_local_cm_rock Z',
+            #         'pos_model_rock X', 'pos_model_rock Y', 'pos_model_rock Z',
+            #         'rot_model_rock W', 'rot_model_rock X', 'rot_model_rock Y', 'rot_model_rock Z',
+            #         'rot_model_rock_EA X', 'rot_model_rock_EA Y', 'rot_model_rock_EA Z',
+            #         'vel_model_rock X', 'vel_model_rock Y', 'vel_model_rock Z',
+            #         'ang_vel_model_rock X', 'ang_vel_model_rock Y', 'ang_vel_model_rock Z',
+            #         'acc_model_rock X', 'acc_model_rock Y', 'acc_model_rock Z',
+            #         'ang_acc_model_rock X', 'ang_acc_model_rock Y', 'ang_acc_model_rock Z',
+            #         'pos_loc_rock X', 'pos_loc_rock Y', 'pos_loc_rock Z',
+            #         'rot_loc_rock W', 'rot_loc_rock X', 'rot_loc_rock Y', 'rot_loc_rock Z',
+            #         'rot_loc_rock_EA X', 'rot_loc_rock_EA Y', 'rot_loc_rock_EA Z',
+            #         'mom_model_rock X', 'mom_model_rock Y', 'mom_model_rock Z',
+            #         'ang_mom_model_rock X', 'ang_mom_model_rock Y', 'ang_mom_model_rock Z',
+            #         'ext_force_rock X', 'ext_force_rock Y', 'ext_force_rock Z']
+            
+            # if os.path.exists(filename) and simulation().getTimeStamp()<=0:
+            #     os.remove(filename)
+            # else:
+            #     with open(filename, mode='a', newline='') as file:
+            #         writer = csv.writer(file)
+                    
+            #         if os.path.getsize(filename) == 0:
+            #             writer.writerow(header)
+                    
+            #         writer.writerow([simulation().getTimeStamp(),
+            #                      pos_cm_rock.x(), pos_cm_rock.y(), pos_cm_rock.z(),
+            #                      rot_cm_rock.w(), rot_cm_rock.x(), rot_cm_rock.y(), rot_cm_rock.z(),
+            #                      rot_cm_rock_EA.x(), rot_cm_rock_EA.y(), rot_cm_rock_EA.z(),
+            #                      trans_local_rock.x(), trans_local_rock.y(), trans_local_rock.z(),
+            #                      trans_local_cm_rock.x(), trans_local_cm_rock.y(), trans_local_cm_rock.z(),
+            #                      pos_model_rock.x(), pos_model_rock.y(), pos_model_rock.z(),
+            #                      rot_model_rock.w(), rot_model_rock.x(), rot_model_rock.y(), rot_model_rock.z(),
+            #                      rot_model_rock_EA.x(), rot_model_rock_EA.y(), rot_model_rock_EA.z(),
+            #                      vel_model_rock.x(), vel_model_rock.y(), vel_model_rock.z(),
+            #                      ang_vel_model_rock.x(), ang_vel_model_rock.y(), ang_vel_model_rock.z(),
+            #                      acc_model_rock.x(), acc_model_rock.y(), acc_model_rock.z(),
+            #                      ang_acc_model_rock.x(), ang_acc_model_rock.y(), ang_acc_model_rock.z(),
+            #                      pos_loc_rock.x(), pos_loc_rock.y(), pos_loc_rock.z(),
+            #                      rot_loc_rock.w(), rot_loc_rock.x(), rot_loc_rock.y(), rot_loc_rock.z(),
+            #                      rot_loc_rock_EA.x(), rot_loc_rock_EA.y(), rot_loc_rock_EA.z(),
+            #                      mom_model_rock.x(), mom_model_rock.y(), mom_model_rock.z(),
+            #                      ang_mom_model_rock.x(), ang_mom_model_rock.y(), ang_mom_model_rock.z(),
+            #                      ext_force_rock.x(), ext_force_rock.y(), ext_force_rock.z()])
+                
+        ###################################################################################
+        # printer(0)
+        return printer
+        
+    StepEventCallback.postCallback(create_printer())
+    
+    ###################################################################################
+    videoRecording = False
+    
+    if videoRecording:
+        # Setup video capture and render to texture
+        application().setupVideoCaptureRenderTotexture()
+
+        # Enable window resizing
+        # application().setAllowWindowResizing(True)
+
+        # Get the video server capture instance
+        vc = application().getVideoServerCapture()
+
+        # Enable synchronization with simulation time
+        vc.getEnableSyncWithSimulation()
+    
+        # Define the folder path for saving the video
+        folder_path = 'Collected_Data'
+
+        # Change the file name to include the folder path and avoid overwriting the previous file
+        video_filename = os.path.join(folder_path, "Agx_Video_Excavator365")
+
+        # Set the video filename in the video capture instance
+        vc.setFilename(video_filename)
+
+        # Start capturing video
+        vc.startCapture()
+        print('Video recording has been started.')
+    
+    ###################################################################################
+    # Use as many cores as we can, except for one
+    agx.setNumThreads(0)
+    n = int(agx.getNumThreads() / 2) - 1
+    agx.setNumThreads(n)
+    
+    application().getSceneDecorator().setBackgroundColor(agxRender.Color.SkyBlue(), agxRender.Color.DodgerBlue())
+    
+    # Enable warm starting of contacts
+    simulation().getDynamicsSystem().setEnableContactWarmstarting(True)
+
+    setupCamera(application())
+    createHelpText(simulation(), application())
+
+
+def buildScene():
+    buildScene1(use_keyboard_gamepad=True)
+
+
+init = init_app(name = __name__, 
+                scenes = [(buildScene1, '1')], 
+                autoStepping = True)
