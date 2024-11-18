@@ -391,6 +391,7 @@ class JointController(agxSDK.StepEventListener):
 
 # A new class tailored for controlling the excavator with its joints instead of poses
 # using a predetermined kinematic solver
+# Or velocity control can also be used
 
 class JointControllerAutomatic(agxSDK.StepEventListener):
     """
@@ -406,6 +407,16 @@ class JointControllerAutomatic(agxSDK.StepEventListener):
         self.constraints["arm"] = excavator.arm_prismatics[0]
         self.constraints["stick"] = excavator.stick_prismatic
         self.constraints["bucket"] = excavator.bucket_prismatic
+
+        self.links = collections.OrderedDict()
+        
+        self.links["cabin_body"] = excavator.chassie_body
+        self.links["arm_body"] = excavator.arm_prismatics[0]
+        self.links["stick_body"] = excavator.stick_prismatic
+        self.links["bucket_body"] = excavator.bucket_body
+
+
+        
         self.joint_counter = 0 #This is used to print debug messages
 
 
@@ -415,6 +426,47 @@ class JointControllerAutomatic(agxSDK.StepEventListener):
         c = excavator.arm_prismatics[1]
         c.getMotor1D().setEnable(False)
         c.getLock1D().setEnable(False)
+
+    def targetVelocity(self, q_dot_cmd):
+        num = 0
+        self.joint_target_vel = collections.OrderedDict()
+
+        for name in self.links:
+            #c = self.constraints[name]
+            self.joint_target_vel[name] = q_dot_cmd[num]
+            num += 1
+
+        self.updateJointVelocities()
+
+    def updateJointVelocities(self):
+
+        for name in self.links:
+            c = self.links[name]
+            #c.getMotor1D().setEnable(False)
+            #c.getLock1D().setEnable(True)
+
+            curr = c.getVelocity()
+            next = self.joint_target_vel[name]
+            vel_error = abs(next - curr)
+
+            # Use an intermediate target to reduce speed
+            #intermediate_target = curr + alpha * (next - curr)
+
+            # Adjust damping based on the current distance to the target
+            #s = vel_error * 0.02
+            #damping = agx.logInterpolate(1/30, 1/2, 0.3 - s)
+            #damping = max(damping, 1 / 30)
+            #c.getLock1D().setDamping(damping)
+
+            # Apply force limits
+            #c.getLock1D().setForceRange(c.getMotor1D().getForceRange())
+
+            #c.getLock1D().setVelocity(next)
+            self.joint_counter += 1
+
+            if self.joint_counter == 4:
+                print("\nTARGET REACHED!")
+                self.joint_counter = 0
 
 
     def targetPose(self, ikSolutions):
@@ -591,6 +643,8 @@ def buildScene1(use_keyboard_gamepad=False):
     # Initialize the angles of the excavator joints
     default_controller = JointControllerAutomatic(excavator)
 
+    
+
     ###################################################################################
 
     # Create a red sphere that will be used to visually mark the target location
@@ -639,16 +693,36 @@ def buildScene1(use_keyboard_gamepad=False):
 
     # This function calculates pseudo-inverse jacobian with a dampening factor using DLS
     def computePseudoInverse(J, damp):
-        JT = np.transpose(J) # n x m
-        JJt = np.multiply(J, JT) # m x m
-        identity = np.eye(JJt.shape[0]) # Number of rwos in JJt
-        inv = np.linalg.inv(np.multiply(JJt, identity * (damp^2))) # m x m
-        J_pseudo = np.multiply(JT, inv) # n x m
+        print(f"Shape of J before transpose: {J.shape}")
+
+        JT = np.transpose(J)  # n x m
+        print("\nJ_step 1")
+        print(f"Shape of JT: {JT.shape}")
+        
+        JJt = J @ JT  # m x m
+        print("\nJ_step 2")
+        print(f"Shape of JJt: {JJt.shape}")
+        
+        identity = np.eye(JJt.shape[0])  # Identity matrix with size m x m
+        print("\nJ_step 3")
+        
+        try:
+            inv = np.linalg.inv(JJt + damp**2 * identity)  # m x m
+        except np.linalg.LinAlgError:
+            print("Matrix inversion failed. The matrix may be singular.")
+            return None
+        
+        print("\nJ_step 4")
+        
+        J_pseudo = JT @ inv  # n x m
+        print("\nJ_step 5")
+        
         return J_pseudo
 
-    # This function will createa  veolocity profile for the excavator joints
-    def velocityController(x, y, z, chain):
-        K = np.matrix([100], [100], [100], [100], [100], [100])
+
+    # This function will create a velocity profile for the excavator joints
+    def computeVelocities(x, y, z):
+        K = np.matrix([[100], [100], [100]])
         damp = 0.03
 
         # Initialize angles with RealVector
@@ -656,6 +730,7 @@ def buildScene1(use_keyboard_gamepad=False):
         q = agx.RealVector()
         # Print the angles for debugging
         for name in default_controller.constraints:
+            print("\n", name)
             angle = default_controller.constraints[name].getAngle()  # Get the angle for each joint
             q.append(angle)
             print(f"Joint {name}: {angle}\n")
@@ -666,26 +741,78 @@ def buildScene1(use_keyboard_gamepad=False):
         if chain.isValid():
             print("\nCHAIN IS VALID!!!\n")
 
+        ##################################################################################
+        # Debug data printing
+
+        # Print out all links (rigid bodies) in the kinematic chain
+        print("\nList of all links in the excavator:\n")
+        links = chain.getLinks()  # Get the link at index i
+
+        for i in links:
+            name = i.getName()
+            print(i, "\n")
+
+        rigid_bodies = excavator.getRigidBodies()
+        print("\n")
+
+        for j in rigid_bodies:
+            print(j, "\n")
+
+        ##################################################################################
+
         fkStatus, fkSolutions = chain.computeForwardKinematics(q)
 
         x_desired = agx.Vec3(x, y, z)
 
-        # Compute error
-        e = np.subtract(x_desired, fkSolutions)
+        x_current = agx.Vec3(fkSolutions[3, 0], fkSolutions[3, 1], fkSolutions[3, 2])
+
+        print(f"\nx: {type(x)}, y: {type(y)}, z: {type(z)}\n")
+        print(f"x__current type: {type(x_current)}")
+        print(f"x_current content: {x_current}")
+        print(f"Single x_current variable type:{type(x_current[0])}\n")
+
+        # Compute error (convert to numpy for manipulation)
+        # Convert Vec3 to numpy arrays for subtraction
+
+        x_desired_np = np.array([x_desired[0], x_desired[1], x_desired[2]])
+        x_current_np = np.array([x_current[0], x_current[1], x_current[2]])
+
+        # Compute the error (now a numpy array)
+        e = np.subtract(x_desired_np,x_current_np)
+
+        print("\nVelocity error:", e)
 
         # Compute desired end-effector velocity
-        x_dot_desired = np.multiply(K, e) # m x 1 vector
+        #x_dot_desired = K * e # m x 1 vector
+        x_dot_desired = np.matrix([[K[0, 0] * e[0]], [K[1, 0] * e[1]], [K[2, 0] * e[2]], [0], [0], [0]])  # 6 x 1 vector
+        print("\nDesired end-effector velocity:", x_dot_desired)
 
         # Compute Jacobian
-        J = chain.computeManipulatorJacobian(q) # m x n matrix
+        jstatus, J = chain.computeManipulatorJacobian(q) # m x n matrix
+        print("\nJACOBIAN STATUS:", jstatus)
+
+        # Compute the inverse of the Jacobian
+
+        # The jacobian is an agx.RealVector with 6xN size
+        jacobian_array = np.zeros((6, len(q)))  # Create a 6xN matrix
+
+        # Copy values from the agx.RealVector to the numpy matrix
+        for j in range(6):
+            for k in range(len(q)):
+                jacobian_array[j, k] = J[j * len(q) + k]
+        
+        #print("\nJacobian array:", jacobian_array)
 
         # Compute pseudo-inverse of Jacobian using DLS
-        J_pseudo = computePseudoInverse(J, damp) # n x m matrix
+        J_pseudo = computePseudoInverse(jacobian_array, damp) # n x m matrix
 
         # Compute joint velocities
-        q_dot = np.multiply(J_pseudo, x_dot_desired) # n x 1 vector
+        print("\nNOW COMPUTING VELOCITIES!")
+        q_dot_cmd = J_pseudo @ x_dot_desired # n x 1 vector
 
-        return q_dot
+        print("\nJOINT VELOCITY COMMANDS:", q_dot_cmd)
+
+        return q_dot_cmd
 
         # Send joint velocity commands to the robot
         #sendJointVelocities(q_dot)
@@ -693,19 +820,7 @@ def buildScene1(use_keyboard_gamepad=False):
         # Wait for next control cycle
         #wait(control_loop_period)
 
-
-
-
-
-
-
-
-            
-        
-
-
-    # Low-level controller with forward kinematics for the bucket of the excavator
-
+    # Computational function with forward kinematics for the bucket of the excavator
     def compFK(x, y, z, returnFlag = False):
         # Setup kinematic chain of the relevant components that will partake in calculated motion
         chain = agxModel.SerialKinematicChain(simulation(), excavator.under_carriage_body, excavator.bucket_body)
@@ -944,6 +1059,27 @@ def buildScene1(use_keyboard_gamepad=False):
         tempChain = agxModel.SerialKinematicChain(simulation(), excavator.under_carriage_body, excavator.bucket_body)
 
         return tempChain
+    
+    #This function performs low-level control with joint velocities
+    def velocityController(x, y, z):
+
+        # Print crucial information before choosing the computational method later
+        print("BUCKET TIP DEFAULT LOCATION\n", excavator.bucket_body.getPosition())
+
+        q_dot_cmd = computeVelocities(x, y, z)
+
+        if len(q_dot_cmd) == 0:
+            print("Joint velocity vector computation has returned an empty solution.\n")
+            return
+            
+
+        #ACTION HAPPENS HERE
+        print("\nVELOCITY ACTION\n")
+        joint_controller = JointControllerAutomatic(excavator)
+        joint_controller.targetVelocity(q_dot_cmd)
+        simulation().add(joint_controller)
+
+        print("\nClick on the excavator window and press 3 for re-run.")
 
     #This function performs the actual control for IK method
     def lowLevelControllerIK(x, y, z):
@@ -1032,11 +1168,11 @@ def buildScene1(use_keyboard_gamepad=False):
                 xx, yy, zz = map(float, input("\nGive x, y and z coordinates separated with an empty space: \n").split())
                 # Create a visual target
                 target = create_red_marker(xx, yy, zz, simulation(), root())
-                solver = input("Press f for forward kinematics or i for inverse kinematics: \n").lower()
+                solver = input("Press f for forward kinematics, i for inverse kinematics, or v for velocity control: \n").lower()
                 #Clear previous balls (WIP)
                 
                 #Activate selected kinematic solver and pass the coordinates to the controller
-                if solver == "i":
+                if solver.lower() == "i":
                     
                     print("Using Inverse Kinematics to move bucket.")
                     lowLevelControllerIK(xx, yy, zz)
@@ -1045,10 +1181,20 @@ def buildScene1(use_keyboard_gamepad=False):
                     prev_y = yy
                     prev_z = zz
 
-                elif solver == "f":
+                elif solver.lower() == "f":
 
                     print("Using Forward Kinematics to move bucket.")
                     lowLevelControllerFK(xx, yy, zz)
+
+                    #Save previous coordinates
+                    prev_x = xx
+                    prev_y = yy
+                    prev_z = zz
+
+                elif solver.lower() == "v":
+                    print("Using velocity controller to move the bucket.")
+
+                    velocityController(xx, yy, zz)
 
                     #Save previous coordinates
                     prev_x = xx
