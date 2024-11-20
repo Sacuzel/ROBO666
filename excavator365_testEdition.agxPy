@@ -427,7 +427,7 @@ class JointControllerAutomatic(agxSDK.StepEventListener):
     def targetVelocity(self, q_dot_cmd): #Create joint velocities
         num = 0
         self.joint_target_vel = collections.OrderedDict()
-        print("\nShape of q_dot_cmd:", q_dot_cmd.shape)
+        #print("\nShape of q_dot_cmd:", q_dot_cmd.shape)
 
         for i, (name, constraint) in enumerate(self.constraints.items()):
             self.joint_target_vel[name] = q_dot_cmd[i, 0]  # Extract scalar value for the joint
@@ -445,7 +445,7 @@ class JointControllerAutomatic(agxSDK.StepEventListener):
             # Get the current speed and the target speed
             # If you want to set the speed of a specific motor, use the setSpeed() method
             target_speed = self.joint_target_vel[name]  # Target speed from your input
-            print("\nTarget speed:", target_speed)
+            #print("\nTarget speed:", target_speed)
             
             # Set the target speed for this joint's motor
             c.getMotor1D().setSpeed(target_speed)
@@ -454,23 +454,19 @@ class JointControllerAutomatic(agxSDK.StepEventListener):
             # This can help reduce abrupt changes in speed
             # However, if you just want to set the speed directly, you can skip this part
             curr_speed = c.getMotor1D().getSpeed()  # If getSpeed() exists
-            print("\nCurrent speed", curr_speed)
+            #print("\nCurrent speed", curr_speed)
             speed_diff = abs(target_speed - curr_speed)
             
 
-            s = speed_diff * 0.02  # Example damping factor
+            s = speed_diff * 0.03  # Example damping factor
             damping = agx.logInterpolate(1/30, 1/2, 0.3 - s)
-            damping = max(damping, 1 / 30)
 
             # Apply damping to the motor
             c.getMotor1D().setDamping(damping)
 
             # Debugging output or checks
-            if speed_diff < 0.01:  # Example condition for when the speed difference is small
-                print(f"\nTarget speed reached for {name}")
-
-
-
+            #if speed_diff < 0.01:  # Example condition for when the speed difference is small
+                #print(f"\nTarget speed reached for {name}")
 
     def targetPose(self, ikSolutions):
 
@@ -518,7 +514,6 @@ class JointControllerAutomatic(agxSDK.StepEventListener):
             # Adjust damping based on the current distance to the target
             s = distance * 0.02
             damping = agx.logInterpolate(1/30, 1/2, 0.3 - s)
-            damping = max(damping, 1 / 30)
             c.getLock1D().setDamping(damping)
 
             # Apply force limits
@@ -694,18 +689,15 @@ def buildScene1(use_keyboard_gamepad=False):
 
     # This function calculates pseudo-inverse jacobian with a dampening factor using DLS
     def computePseudoInverse(J, damp):
-        print(f"Shape of J before transpose: {J.shape}")
+        #print(f"Shape of J before transpose: {J.shape}")
 
         JT = np.transpose(J)  # n x m
-        print("\nJ_step 1")
-        print(f"Shape of JT: {JT.shape}")
+        #print(f"Shape of JT: {JT.shape}")
         
         JJt = J @ JT  # m x m
-        print("\nJ_step 2")
-        print(f"Shape of JJt: {JJt.shape}")
+        #print(f"Shape of JJt: {JJt.shape}")
         
         identity = np.eye(JJt.shape[0])  # Identity matrix with size m x m
-        print("\nJ_step 3")
         
         try:
             inv = np.linalg.inv(JJt + damp**2 * identity)  # m x m
@@ -713,56 +705,32 @@ def buildScene1(use_keyboard_gamepad=False):
             print("Matrix inversion failed. The matrix may be singular.")
             return None
         
-        print("\nJ_step 4")
-        
         J_pseudo = JT @ inv  # n x m
-        print("\nJ_step 5")
         
         return J_pseudo
 
     # This function will create a velocity profile for the excavator joints
-    def computeVelocities(x, y, z, tolerance):
-        K = np.matrix([[100], [100], [100]])
+    def computeVelocities(target, kineChain, angles):
+        K = np.matrix([[3.5], [3.5], [3.5]])
         damp = 0.03
 
-        # Initialize angles with RealVector
-        print("Initial Joint Angles:\n") #For debugging purposes
-        q = agx.RealVector()
-        # Print the angles for debugging
-        for name in default_controller.constraints:
-            print("\n", name)
-            angle = default_controller.constraints[name].getAngle()  # Get the angle for each joint
-            q.append(angle)
-            print(f"Joint {name}: {angle}\n")
-
+        # Initialize angles
+        q = angles
 
         # Setup kinematic chain of the relevant components that will partake in calculated motion
-        chain = agxModel.SerialKinematicChain(simulation(), excavator.under_carriage_body, excavator.bucket_body)
-        if chain.isValid():
-            print("\nCHAIN IS VALID!!!\n")
+        chain = kineChain
+
+        # Smoothing factor for the error
+        smoother = 0.5
 
         ##################################################################################
         # Debug data printing
-
-        # Print out all links (rigid bodies) in the kinematic chain
-        print("\nList of all links in the excavator:\n")
-        links = chain.getLinks()  # Get the link at index i
-
-        for i in links:
-            name = i.getName()
-            print(i, "\n")
-
-        #rigid_bodies = excavator.getRigidBodies()
-        #print("\n")
-
-        #for j in rigid_bodies:
-            #print(j, "\n")
 
         ##################################################################################
 
         fkStatus, fkSolutions = chain.computeForwardKinematics(q)
 
-        x_desired = agx.Vec3(x, y, z) # Target in world frame
+        x_desired = target # Target in world frame
 
         x_current = agx.Vec3(fkSolutions[3, 0], fkSolutions[3, 1], fkSolutions[3, 2]) # Bucket position in world frame
 
@@ -772,18 +740,20 @@ def buildScene1(use_keyboard_gamepad=False):
         x_current_np = np.array([x_current[0], x_current[1], x_current[2]])
 
         # Compute the error (now a numpy array)
-        e = np.subtract(x_desired_np,x_current_np)
+        error = np.subtract(x_desired_np,x_current_np)
+        # Smooth the error to avoid overshoot
+        e = np.subtract(x_desired_np,x_current_np)*smoother
 
-        print("\nVelocity error:", e)
+        print("\n(SMOOTH) Velocity error:", e)
 
         # Compute desired end-effector velocity
         #x_dot_desired = K * e # m x 1 vector
         x_dot_desired = np.matrix([[K[0, 0] * e[0]], [K[1, 0] * e[1]], [K[2, 0] * e[2]], [0], [0], [0]])  # 6 x 1 vector
-        print("\nDesired end-effector velocity:\n", x_dot_desired)
+        #print("\nDesired end-effector velocity:\n", x_dot_desired)
 
         # Compute Jacobian
         jstatus, J = chain.computeManipulatorJacobian(q) # m x n matrix
-        print("\nJACOBIAN STATUS:", jstatus)
+        #print("\nJACOBIAN STATUS:", jstatus)
 
         # Compute the inverse of the Jacobian
 
@@ -801,24 +771,100 @@ def buildScene1(use_keyboard_gamepad=False):
         J_pseudo = computePseudoInverse(jacobian_array, damp) # n x m matrix
 
         # Compute joint velocities
-        print("\nNOW COMPUTING VELOCITIES!")
+        #print("\nNOW COMPUTING VELOCITIES!")
         q_dot_cmd = J_pseudo @ x_dot_desired # n x 1 vector
 
-        print("\nJOINT VELOCITY COMMANDS:\n", q_dot_cmd)
+        #print("\nJOINT VELOCITY COMMANDS:\n", q_dot_cmd)
 
-        # Here we will implement logic which will check whether target is within reach
-        # Check if the current position is close enough to the target
-
-        distance = np.linalg.norm(x_desired_np - x_current_np)
-        target_reached = distance <= tolerance
-
-        return q_dot_cmd, target_reached
+        return q_dot_cmd
 
         # Send joint velocity commands to the robot
         #sendJointVelocities(q_dot)
 
         # Wait for next control cycle
         #wait(control_loop_period)
+
+    
+    # This function performs velocity control by utilizing computeVelocities and a kinematic chain that updates motion.
+    def compVel(x,y,z, tolerance, repetitions):
+
+        # Setup kinematic chain of the relevant components that will partake in calculated motion
+        chain = agxModel.SerialKinematicChain(simulation(), excavator.under_carriage_body, excavator.bucket_body)
+        if not chain.isValid():
+            print("\nCHAIN IS NOT VALID!!!\n")
+
+        # Initialize private model with the controller class
+        machine_controller = default_controller
+
+        retries = 0
+
+        # Initialize angles with RealVector
+        angles = agx.RealVector()
+
+        # Target position in world coordinates
+        target_in_world = agx.Vec3(x, y, z)
+
+         # First we will transform target from world frame to excavator's kinematic chain's base frame
+        excavator_body_transform = excavator.under_carriage_body.getTransform()
+        excavator_body_transform_inv = excavator_body_transform.inverse()
+        target_in_body_frame = excavator_body_transform_inv*target_in_world
+
+        # Now we get the location of excavator's bucket
+        bucket_transform_world = excavator.bucket_body.getTransform()
+        bucket_world_frame = bucket_transform_world.getTranslate()  # Bucket's world position
+
+        # Now we need bucket's position in excavator's body frame as well
+        bucket_in_body_frame = excavator_body_transform_inv*bucket_world_frame
+
+        # Then we need distance (aka error) between bucket and goal
+        fraction = 0.01
+        error = (target_in_world - bucket_world_frame)*fraction
+        print("\nDISTANCE FROM THE TARGET: ", error.length())
+        print("")
+
+        # Check if already within tolerance (e.g. if user gives point too close to the bucket)
+        if error.length() < tolerance:
+            print("\nTARGET ALREADY WITHIN TOLERANCE!\n")
+            return 0, angles
+        
+        # Now we loop the velocity controller until target is reached within the tolerance
+        while retries < repetitions:
+
+            # Update the angles
+            angles.clear()
+            for name in machine_controller.constraints:
+                angle = machine_controller.constraints[name].getAngle()  # Get the angle for each joint
+                angles.append(angle)
+                #print(f"Joint {name}: {angle}\n")
+
+            # Get new speed profiles for the joints
+            q_dot_cmd = computeVelocities(target_in_world, chain, angles)
+
+            if len(q_dot_cmd) == 0:
+                print("Joint velocity computation has returned an empty solution!\n")
+                return
+
+            # Apply joint velocities
+            #print("\nVELOCITY ACTION\n")
+            machine_controller.targetVelocity(q_dot_cmd)
+            simulation().add(machine_controller)
+            # Advance the simulation by one step
+            simulation().stepForward()
+            
+            retries += 1
+
+            # Recalculate the error
+            bucket_world_frame = excavator.bucket_body.getTransform().getTranslate()
+            error = (target_in_world - bucket_world_frame)
+            distance = error.length()
+            print("\nUpdated Distance to Target: ", error.length())
+            # Print bucket's location for debugging
+            print("\nBucket's location in world space:\n", bucket_world_frame)
+
+            if distance < tolerance:
+                print(f"\nTarget reached after {retries} repetitions!")
+            
+        print(f"\nMax retries of {retries} has been reached, but alas the target is not within our grasp.\n")
 
 
     # Computational function with forward kinematics for the bucket of the excavator
@@ -959,6 +1005,7 @@ def buildScene1(use_keyboard_gamepad=False):
                 #Print the error
                 print("Distance error:", distance)
 
+
             # Check if the error is within the tolerance
             if distance < tolerance:
                 print("\nGoal reached within tolerance after", repeat_counter, "repetitions!!!")
@@ -1042,54 +1089,36 @@ def buildScene1(use_keyboard_gamepad=False):
 
     # This function performs intermediary control during iterative kinematics
     # It returns a new kinematic chain configuration to be used in the next iteration
-    def tempControllerIterative(fkSolutions, haltFlag = False):
+    def tempControllerIterative(joint_config, velocityFlag = False):
 
-        if len(fkSolutions) == 0:
-            print("Forward Kinematic computation has returned an empty solution.\n")
+        if len(joint_config) == 0:
+            print("Joint configuration has returned an empty solution.\n")
             return
 
         # Create a new joint controller
         joint_controller = JointControllerAutomatic(excavator)
-        # Get new kinematic chain with new joint angles
-        chain_update = JointControllerAutomatic(excavator).targetPoseFK(fkSolutions)
+
+        if not velocityFlag:
+
+            # Get new kinematic chain with new joint angles
+            chain_update = JointControllerAutomatic(excavator).targetPoseFK(joint_config)
 
         #ACTION HAPPENS HERE
-        joint_controller.targetPose(fkSolutions)
+        joint_controller.targetPose(joint_config)
         simulation().add(chain_update)
+
         # Create a temporary kinematic chain
         tempChain = agxModel.SerialKinematicChain(simulation(), excavator.under_carriage_body, excavator.bucket_body)
 
         return tempChain
     
     #This function performs low-level control with joint velocities
-    def velocityController(x, y, z, tolerance = 0.01, repetitions = 10):
+    def velocityController(x, y, z, tolerance = 0.001, repetitions = 50):
 
         # Print crucial information before choosing the computational method later
         print("BUCKET TIP DEFAULT LOCATION\n", excavator.bucket_body.getPosition())
 
-        retries = 0
-        target_reached = False
-
-        while retries < repetitions and not target_reached:
-
-
-            q_dot_cmd, target_reached = computeVelocities(x, y, z, tolerance)
-
-            if len(q_dot_cmd) == 0:
-                print("Joint velocity computation has returned an empty solution.\n")
-                return
-
-            # Apply joint velocities
-            print("VELOCITY ACTION\n")
-            joint_controller = JointControllerAutomatic(excavator)
-            joint_controller.targetVelocity(q_dot_cmd)
-            simulation().add(joint_controller)
-            retries += 1
-
-            if target_reached:
-                print("\nTarget reached!")
-            else:
-                print("\nMax retries reached, target not reached.")
+        compVel(x,y,z, tolerance, repetitions)
 
         print("\nClick on the excavator window and press 3 for re-run.")
 
@@ -1334,12 +1363,12 @@ def buildScene1(use_keyboard_gamepad=False):
 
     def automatic_digging_once():
         global call_counter
-        if call_counter % 2 == 1: # This prevents the function from double calls
+        if call_counter == 1: # This prevents the function from double calls
             start_automatic_digging()
-            call_counter = 2 # Next time call will fail
+            call_counter = 1 # Next time call will fail
         
         else:
-            call_counter = 1 # Increment the value when call is skipped
+            call_counter = 2 # Change the value when call is skipped
 
     # Bind a keyboard button for starting the automatic digging cycle
     Input.bind(name='Automatic Digging',
