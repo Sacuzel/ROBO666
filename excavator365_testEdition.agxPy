@@ -424,7 +424,7 @@ class JointControllerAutomatic(agxSDK.StepEventListener):
         c.getMotor1D().setEnable(False)
         c.getLock1D().setEnable(False)
 
-    def targetVelocity(self, q_dot_cmd): #Create joint velocities
+    def targetVelocity(self, q_dot_cmd): # Create joint velocities
         num = 0
         self.joint_target_vel = collections.OrderedDict()
         #print("\nShape of q_dot_cmd:", q_dot_cmd.shape)
@@ -434,6 +434,12 @@ class JointControllerAutomatic(agxSDK.StepEventListener):
 
         self.updateJointVelocities()
 
+    def lockJoints(self):
+        for name in self.constraints:
+            c = self.constraints[name]
+            c.getMotor1D().setEnable(False)
+            #c.getLock1D().setEnable(True)
+
     def updateJointVelocities(self):
         for name in self.constraints:
             c = self.constraints[name]
@@ -442,10 +448,9 @@ class JointControllerAutomatic(agxSDK.StepEventListener):
             c.getLock1D().setEnable(False)
             c.getMotor1D().setEnable(True)
 
-            # Get the current speed and the target speed
-            # If you want to set the speed of a specific motor, use the setSpeed() method
+            # Set the target speed
             target_speed = self.joint_target_vel[name]  # Target speed from your input
-            #print("\nTarget speed:", target_speed)
+            print("\nTarget speed:", target_speed, "for joint:", name)
             
             # Set the target speed for this joint's motor
             c.getMotor1D().setSpeed(target_speed)
@@ -456,7 +461,6 @@ class JointControllerAutomatic(agxSDK.StepEventListener):
             curr_speed = c.getMotor1D().getSpeed()  # If getSpeed() exists
             #print("\nCurrent speed", curr_speed)
             speed_diff = abs(target_speed - curr_speed)
-            
 
             s = speed_diff * 0.03  # Example damping factor
             damping = agx.logInterpolate(1/30, 1/2, 0.3 - s)
@@ -711,6 +715,30 @@ def buildScene1(use_keyboard_gamepad=False):
         base_link_transform = base_link[0].getTransform()
         print("Base link transform:\n", base_link_transform)
 
+    # This function creates intermediary targets
+    def generateTrajectoryWithAlignment(start, target, undercarriage_transform, target_local, step_size=0.5):
+        intermediate_targets = []
+
+        if target_local[0] <= 0:  # If behind
+            print("Target is behind. Rotating first.")
+            # Add a waypoint in front to rotate the base
+            rotated_target = np.array([step_size, 0, 0])  # Forward in local frame
+            rotated_target_global = np.dot(undercarriage_transform, np.append(rotated_target, 1))[:3]
+            intermediate_targets.append(rotated_target_global)
+        
+        # Continue generating linear path to target
+        direction = (target - intermediate_targets[-1]) / np.linalg.norm(target - intermediate_targets[-1])
+        num_steps = int(np.linalg.norm(target - intermediate_targets[-1]) / step_size)
+        
+        for i in range(1, num_steps + 1):
+            waypoint = intermediate_targets[-1] + direction * (step_size * i)
+            intermediate_targets.append(waypoint)
+        
+        intermediate_targets.append(target)  # Add final target
+        return intermediate_targets
+
+
+
     # This function calculates pseudo-inverse jacobian with a dampening factor using DLS
     def computePseudoInverse(J, damp):
         #print(f"Shape of J before transpose: {J.shape}")
@@ -735,9 +763,9 @@ def buildScene1(use_keyboard_gamepad=False):
 
     # This function will create a velocity profile for the excavator joints
     def computeVelocities(target, kineChain, angles):
-        K = np.matrix([[2], [2], [2]])
-        K_J = np.matrix([[2], [2], [2], [2]])
-        damp = 1
+        K = np.matrix([[1.2], [1.2], [1.2]])
+        K_J = np.matrix([[0.8], [-0.8], [0.8], [0.8]])
+        damp = 0.5
 
         # Initialize angles
         q = angles
@@ -758,23 +786,30 @@ def buildScene1(use_keyboard_gamepad=False):
         fkStatus, fkSolutions = chain.computeForwardKinematics(q, True)
 
         x_desired = target # Target in base (body) frame
-        #print("X_DESIRED:", x_desired)
+        print("X_DESIRED (BODY FRAME):", x_desired)
         print("")
+        #x_current = agx.Vec3(fkSolutions[3, 0], fkSolutions[3, 1], fkSolutions[3, 2]) # Bucket position in base frame
 
-        x_current = agx.Vec3(fkSolutions[3, 0], fkSolutions[3, 1], fkSolutions[3, 2]) # Bucket position in base frame
-        #print("X_CURRENT:", x_current)
+        excavator_body_transform = excavator.under_carriage_body.getTransform()
+        excavator_body_transform_inv = excavator_body_transform.inverse()
+
+        bucket_world_frame = excavator.bucket_body.getTransform() # Bucket's world frame
+
+        # Now we need bucket's transformation in excavator's body frame as well
+        x_current = excavator_body_transform_inv*bucket_world_frame
+
+        print("X_CURRENT (BODY FRAME):", x_current)
         print("")
+        print("KINEMATIC CHAIN (fkSolutions):", fkSolutions, "\n")
         # Compute error (convert to numpy for manipulation)
         # Convert Vec3 to numpy arrays for subtraction
         x_desired_np = np.array([x_desired[0], x_desired[1], x_desired[2]])
-        x_current_np = np.array([x_current[0], x_current[1], x_current[2]])
+        # Now we need bucket's transformation in excavator's body frame as well
+        x_current_np = np.array([x_current[3,0], x_current[3,1], x_current[3,2]])
 
         # Compute the error (now a numpy array)
-        error = np.subtract(x_desired_np,x_current_np)
-        #print("COORDINATE ERRORS:", "\n", error[0], error[1], error[2])
-        # Smooth the error to avoid overshoot
         e = np.subtract(x_desired_np,x_current_np)
-
+        #print("COORDINATE ERRORS:", "\n", error[0], error[1], error[2])
         print("\n Velocity error:", e)
 
         # Compute desired end-effector velocity
@@ -805,7 +840,7 @@ def buildScene1(use_keyboard_gamepad=False):
         #print("\nNOW COMPUTING VELOCITIES!")
         q_dot_cmd = J_pseudo @ x_dot_desired # n x 1 vector
 
-        #print("\nJOINT VELOCITY COMMANDS:\n", q_dot_cmd)
+        print("\nJOINT VELOCITY COMMANDS:\n", q_dot_cmd)
         
         q_dot_cmd_gained = np.multiply(q_dot_cmd,K_J)
 
@@ -840,20 +875,25 @@ def buildScene1(use_keyboard_gamepad=False):
         # Target position in world coordinates
         target_in_world = agx.Vec3(x, y, z)
 
-         # First we will transform target from world frame to excavator's kinematic chain's base frame
+        # First we will transform target from world frame to excavator's kinematic chain's base frame
         excavator_body_transform = excavator.under_carriage_body.getTransform()
         excavator_body_transform_inv = excavator_body_transform.inverse()
-        target_in_body_frame = target_in_world*excavator_body_transform_inv
+        print("EXCAVATOR BODY TRANSFORM:", excavator_body_transform, "\n")
+        # Create custom transformation matrix for the target
+        target_transformation_matrix = np.matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [x, y, z, 1]])
+        target_in_body_frame = excavator_body_transform_inv*target_transformation_matrix
+        # Position of target in base frame
+        target_in_body_pos = np.array([target_in_body_frame[3,0], target_in_body_frame[3,1], target_in_body_frame[3,2]])
+        print("EXCAVATOR BODY TRANSFORM INVERSE:", excavator_body_transform_inv, "\n")
 
         # Now we get the location of excavator's bucket
-        bucket_world_frame = excavator.bucket_body.getTransform().getTranslate() # Bucket's world position
+        bucket_world_pos = excavator.bucket_body.getTransform().getTranslate() # Bucket's world position
 
         # Now we need bucket's position in excavator's body frame as well
-        bucket_in_body_frame = excavator_body_transform_inv*bucket_world_frame
+        bucket_in_body_frame = excavator_body_transform_inv*bucket_world_pos
 
         # Then we need distance (aka error) between bucket and goal
-        fraction = 1
-        error = (target_in_world - bucket_world_frame)*fraction
+        error = (target_in_world - bucket_world_pos)
         print("\nDISTANCE FROM THE TARGET: ", error.length())
         print("")
 
@@ -862,9 +902,9 @@ def buildScene1(use_keyboard_gamepad=False):
             print("\nTARGET ALREADY WITHIN TOLERANCE!\n")
             return 0, angles
         
-        print("TARGET IN BODY:", target_in_body_frame)
+        print("\nTARGET IN BODY:", target_in_body_frame)
         print("")
-        print("TARGET IN WORLD FRAME:", target_in_world, "\n")
+        print("\nTARGET IN WORLD FRAME:", target_in_world, "\n")
         
         # Now we loop the velocity controller until target is reached within the tolerance
         while retries < repetitions:
@@ -876,8 +916,36 @@ def buildScene1(use_keyboard_gamepad=False):
                 angles.append(angle)
                 #print(f"Joint {name}: Angle: {angle}\n")
 
+            # Update the frames and recalculate the error
+
+            bucket_world_frame = excavator.bucket_body.getTransform()
+            bucket_in_body_frame = excavator_body_transform_inv*bucket_world_frame
+            #print("\nTARGET IN BODY FRAME:", target_in_body_frame)
+            #print("\nBUCKET IN BODY FRAME:", bucket_in_body_frame)
+            
+            bucket_in_body_np = np.array([bucket_in_body_frame[3,0], bucket_in_body_frame[3,1], bucket_in_body_frame[3,2]])
+
+            error_b = (target_in_body_pos - bucket_in_body_np)
+            distance = np.linalg.norm(error_b)
+
+            # Update world positions
+            bucket_world_pos = excavator.bucket_body.getTransform().getTranslate() # Bucket's world position
+            error = (target_in_world - bucket_world_pos)
+            excavator_body_transform = excavator.under_carriage_body.getTransform()
+            excavator_body_transform_inv = excavator_body_transform.inverse()
+            # print("EXCAVATOR BODY TRANSFORM:", excavator_body_transform, "\n")
+            # Create custom transformation matrix for the target
+            target_transformation_matrix = np.matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [x, y, z, 1]])
+            target_in_body_frame = excavator_body_transform_inv*target_transformation_matrix
+            # Position of target in base frame
+            target_in_body_pos = np.array([target_in_body_frame[3,0], target_in_body_frame[3,1], target_in_body_frame[3,2]])
+            # print("EXCAVATOR BODY TRANSFORM INVERSE:", excavator_body_transform_inv, "\n")
+
+            print("\nUpdated Distance to Target (BASE FRAME): ", distance)
+            print("\nUpdated Distance to Target (WORLD FRAME): ", error.length())
+
             # Get new speed profiles for the joints
-            q_dot_cmd = computeVelocities(target_in_body_frame, chain, angles)
+            q_dot_cmd = computeVelocities(target_in_body_pos, chain, angles)
 
             if len(q_dot_cmd) == 0:
                 print("Joint velocity computation has returned an empty solution!\n")
@@ -892,22 +960,28 @@ def buildScene1(use_keyboard_gamepad=False):
         
             retries += 1
 
-            # Update the frames and recalculate the error
-            bucket_world_frame = excavator.bucket_body.getTransform().getTranslate()
-            bucket_in_body_frame = excavator_body_transform_inv*bucket_world_frame
 
-            error = (target_in_body_frame - bucket_in_body_frame)*fraction
-            distance = error.length()
-
-            print("\nUpdated Distance to Target (BASE FRAME): ", error.length())
             # Print bucket's location for debugging
-            print("\nBucket's location in world space:\n", bucket_world_frame)
-            print("Bucket's location in base frame: \n", bucket_in_body_frame)
+            print("\nBucket's position in world space:\n", bucket_world_pos)
+            print("\nBucket's position in base frame: \n", bucket_in_body_np)
 
             if distance < tolerance:
-                print(f"\nTarget reached after {retries} repetitions!")
+                print(f"\n=== TARGET REACHED AFTER {retries} REPETITIONS! ===")
+                zeroSpeeds = np.zeros_like(q_dot_cmd)
+                machine_controller.targetVelocity(zeroSpeeds)
+                simulation().add(machine_controller)
+                # Advance the simulation by one step
+                simulation().stepForward()
+                return
             
-        print(f"\nMax retries of {retries} has been reached, but alas the target is not within our grasp.\n")
+            elif retries >= repetitions:
+                print(f"\n=== FAILURE! ===\nMax retries of {retries} has been reached, but alas the target is not within our grasp.\n")
+                zeroSpeeds = np.zeros_like(q_dot_cmd)
+                machine_controller.targetVelocity(zeroSpeeds)
+                simulation().add(machine_controller)
+                # Advance the simulation by one step
+                simulation().stepForward()
+                return
 
 
     # Computational function with forward kinematics for the bucket of the excavator
@@ -925,7 +999,7 @@ def buildScene1(use_keyboard_gamepad=False):
         for name in autoExcavator.constraints:
             angle = autoExcavator.constraints[name].getAngle()  # Get the angle for each joint
             angles.append(angle)
-            print(f"Joint {name}: {angle}\n")
+            #print(f"Joint {name}: {angle}\n")
 
         # Target position in world coordinates
         target_in_world = agx.Vec3(x, y, z)
@@ -933,7 +1007,8 @@ def buildScene1(use_keyboard_gamepad=False):
         # First we will transform target from world frame to excavator's kinematic chain's base frame
         excavator_body_transform = excavator.under_carriage_body.getTransform()
         excavator_body_transform_inv = excavator_body_transform.inverse()
-        target_in_body_frame = target_in_world*excavator_body_transform_inv # USE THIS!
+        target_in_body_frame = excavator_body_transform_inv*target_in_world # USE THIS!
+        print("\nTARGET IN BODY FRAME:", target_in_body_frame, "\n")
 
         # Now we get the location of excavator's bucket
         bucket_transform_world = excavator.bucket_body.getTransform()
@@ -1156,7 +1231,7 @@ def buildScene1(use_keyboard_gamepad=False):
         return tempChain
     
     # This function performs low-level control with joint velocities
-    def velocityController(x, y, z, tolerance = 0.001, repetitions = 20):
+    def velocityController(x, y, z, tolerance = 0.03, repetitions = 500):
 
         # Print crucial information before choosing the computational method later
         print("BUCKET TIP DEFAULT LOCATION\n", excavator.bucket_body.getPosition())
