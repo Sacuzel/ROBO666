@@ -77,6 +77,9 @@ import csv
 import random
 import agxIO
 
+# Import ROS2
+import agxROS2
+
 # Libraries
 import time
 
@@ -717,26 +720,40 @@ def buildScene1(use_keyboard_gamepad=False):
 
     # This function creates intermediary targets
     def generateTrajectoryWithAlignment(start, target, undercarriage_transform, target_local, step_size=0.5):
-        intermediate_targets = []
+        intermediate_targets = [np.array(start)]
 
-        if target_local[0] <= 0:  # If behind
-            print("Target is behind. Rotating first.")
-            # Add a waypoint in front to rotate the base
+        if target_local[0] > 0:  # If behind
+            print("\nTarget is behind. Rotating first.\n")
             rotated_target = np.array([step_size, 0, 0])  # Forward in local frame
-            rotated_target_global = np.dot(undercarriage_transform, np.append(rotated_target, 1))[:3]
-            intermediate_targets.append(rotated_target_global)
-        
-        # Continue generating linear path to target
-        direction = (target - intermediate_targets[-1]) / np.linalg.norm(target - intermediate_targets[-1])
-        num_steps = int(np.linalg.norm(target - intermediate_targets[-1]) / step_size)
-        
-        for i in range(1, num_steps + 1):
-            waypoint = intermediate_targets[-1] + direction * (step_size * i)
-            intermediate_targets.append(waypoint)
-        
-        intermediate_targets.append(target)  # Add final target
-        return intermediate_targets
+            rotated_target_vec = agx.Vec3(rotated_target[0], rotated_target[1], rotated_target[2])
 
+            # Transform using undercarriage and convert to NumPy
+            rotated_target_global = undercarriage_transform.transformPoint(rotated_target_vec)
+            rotated_target_global_np = np.array([rotated_target_global.x(), rotated_target_global.y(), rotated_target_global.z()])
+
+            intermediate_targets.append(rotated_target_global_np)
+
+        # Ensure target is a NumPy array (if it's a Vec3, extract components)
+        if isinstance(target, agx.Vec3):
+            target_np = np.array(target)
+
+        # Ensure intermediate_targets[-1] is a NumPy array (if it's a Vec3, extract components)
+        last_point = intermediate_targets[-1]
+        print(type(last_point))
+        last_point_np = np.array(last_point)
+
+        # Compute the direction vector using NumPy array operations
+        direction = (target_np - last_point_np) / np.linalg.norm(target_np - last_point_np)
+        num_steps = int(np.linalg.norm(target_np - last_point_np) / step_size)
+
+        # Generate the intermediate waypoints
+        for i in range(1, num_steps + 1):
+            waypoint = last_point + direction * (step_size * i)
+            intermediate_targets.append(waypoint)
+
+        # Append the final target
+        intermediate_targets.append(target)
+        return intermediate_targets
 
 
     # This function calculates pseudo-inverse jacobian with a dampening factor using DLS
@@ -798,9 +815,9 @@ def buildScene1(use_keyboard_gamepad=False):
         # Now we need bucket's transformation in excavator's body frame as well
         x_current = excavator_body_transform_inv*bucket_world_frame
 
-        print("X_CURRENT (BODY FRAME):", x_current)
+        #print("X_CURRENT (BODY FRAME):", x_current)
         print("")
-        print("KINEMATIC CHAIN (fkSolutions):", fkSolutions, "\n")
+        #print("KINEMATIC CHAIN (fkSolutions):", fkSolutions, "\n")
         # Compute error (convert to numpy for manipulation)
         # Convert Vec3 to numpy arrays for subtraction
         x_desired_np = np.array([x_desired[0], x_desired[1], x_desired[2]])
@@ -854,7 +871,7 @@ def buildScene1(use_keyboard_gamepad=False):
 
     
     # This function performs velocity control by utilizing computeVelocities and a kinematic chain that updates motion.
-    def compVel(x,y,z, tolerance, repetitions):
+    def compVel(x,y,z, tolerance, repetitions): # Flag detemriens whether simulation values are in Unreal or AGX
 
         # Setup kinematic chain of the relevant components that will partake in calculated motion
         chain = agxModel.SerialKinematicChain(simulation(), excavator.under_carriage_body, excavator.bucket_body)
@@ -900,11 +917,11 @@ def buildScene1(use_keyboard_gamepad=False):
         # Check if already within tolerance (e.g. if user gives point too close to the bucket)
         if error.length() < tolerance:
             print("\nTARGET ALREADY WITHIN TOLERANCE!\n")
-            return 0, angles
+            return
         
-        print("\nTARGET IN BODY:", target_in_body_frame)
+        #print("\nTARGET IN BODY:", target_in_body_frame)
         print("")
-        print("\nTARGET IN WORLD FRAME:", target_in_world, "\n")
+        #print("\nTARGET IN WORLD FRAME:", target_in_world, "\n")
         
         # Now we loop the velocity controller until target is reached within the tolerance
         while retries < repetitions:
@@ -917,7 +934,6 @@ def buildScene1(use_keyboard_gamepad=False):
                 #print(f"Joint {name}: Angle: {angle}\n")
 
             # Update the frames and recalculate the error
-
             bucket_world_frame = excavator.bucket_body.getTransform()
             bucket_in_body_frame = excavator_body_transform_inv*bucket_world_frame
             #print("\nTARGET IN BODY FRAME:", target_in_body_frame)
@@ -957,9 +973,24 @@ def buildScene1(use_keyboard_gamepad=False):
             simulation().add(machine_controller)
             # Advance the simulation by one step
             simulation().stepForward()
+            time.sleep(1)
         
             retries += 1
 
+            ######################################################################
+            # ROS2 process
+            
+            vel_cmds = q_dot_cmd.flatten().tolist()[0]
+            print(vel_cmds)
+
+
+            publisher = agxROS2.PublisherStdMsgsFloat64MultiArray("vel_cmd")
+
+            msgSend = agxROS2.StdMsgsFloat64MultiArray()
+            msgSend.data = q_dot_cmd.flatten().tolist()[0]
+            publisher.sendMessage(msgSend)
+
+            ######################################################################
 
             # Print bucket's location for debugging
             print("\nBucket's position in world space:\n", bucket_world_pos)
@@ -967,6 +998,11 @@ def buildScene1(use_keyboard_gamepad=False):
 
             if distance < tolerance:
                 print(f"\n=== TARGET REACHED AFTER {retries} REPETITIONS! ===")
+                # LOCK ROS2 joints
+                msgSend.data = [0,0,0,0]
+                print("ROS2 data:", msgSend.data)
+                time.sleep(1)
+                publisher.sendMessage(msgSend)
                 zeroSpeeds = np.zeros_like(q_dot_cmd)
                 machine_controller.targetVelocity(zeroSpeeds)
                 simulation().add(machine_controller)
@@ -976,6 +1012,11 @@ def buildScene1(use_keyboard_gamepad=False):
             
             elif retries >= repetitions:
                 print(f"\n=== FAILURE! ===\nMax retries of {retries} has been reached, but alas the target is not within our grasp.\n")
+                # LOCK ROS2 joints
+                msgSend.data = [0,0,0,0]
+                time.sleep(1)
+                publisher.sendMessage(msgSend)
+                print("ROS2 data:", msgSend.data)
                 zeroSpeeds = np.zeros_like(q_dot_cmd)
                 machine_controller.targetVelocity(zeroSpeeds)
                 simulation().add(machine_controller)
@@ -1231,14 +1272,55 @@ def buildScene1(use_keyboard_gamepad=False):
         return tempChain
     
     # This function performs low-level control with joint velocities
-    def velocityController(x, y, z, tolerance = 0.03, repetitions = 500):
+    def velocityController(x, y, z, tolerance = 0.03, repetitions = 10):
 
         # Print crucial information before choosing the computational method later
-        print("BUCKET TIP DEFAULT LOCATION\n", excavator.bucket_body.getPosition())
+        bucket_position = excavator.bucket_body.getPosition()
+        print("BUCKET TIP DEFAULT LOCATION:\n", bucket_position)
+        target_in_world = agx.Vec3(x,y,z)
 
-        compVel(x,y,z, tolerance, repetitions)
+        ###########################################################
+        # Frame computations
+        undercarriage_transform = excavator.under_carriage_body.getTransform()
+        bucket_world_pos = excavator.bucket_body.getTransform().getTranslate() # Bucket's world position
+        error = (target_in_world - bucket_world_pos)
+        excavator_body_transform = excavator.under_carriage_body.getTransform()
+        excavator_body_transform_inv = excavator_body_transform.inverse()
+        # print("EXCAVATOR BODY TRANSFORM:", excavator_body_transform, "\n")
+        # Create custom transformation matrix for the target
+        target_transformation_matrix = np.matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [x, y, z, 1]])
+        target_in_body_frame = excavator_body_transform_inv*target_transformation_matrix
+        # Position of target in base frame
+        target_in_body_pos = np.array([target_in_body_frame[3,0], target_in_body_frame[3,1], target_in_body_frame[3,2]])
 
-        print("\nClick on the excavator window and press 3 for re-run.")
+        ###########################################################
+        if(repetitions > 1000000):
+
+            intermediate_targets = generateTrajectoryWithAlignment(bucket_position, target_in_world, undercarriage_transform, target_in_body_pos)
+            print(f"Generated {len(intermediate_targets)} intermediate targets")
+            print(f"Intermediate targets: {intermediate_targets}")
+
+
+            # Distance between target and bucket
+            distance = bucket_position - agx.Vec3(x,y,z)
+            tempReps = 0 # Repetitions
+
+            for target in intermediate_targets:
+                if distance.length() > tolerance:
+                    print(f"Moving to intermediate target: {target}")
+                    compVel(target[0], target[1], target[2], tolerance, repetitions)
+                    tempReps += 1
+                # Add a break condition if the target is reached.
+                else:
+                    print(f"\n=== TARGET REACHED AFTER {tempReps} REPETITIONS! ===")
+                    print("\nClick on the excavator window and press 3 for re-run.")
+
+        else:
+            compVel(x,y,z, tolerance, repetitions)
+            print("\nClick on the excavator window and press 3 for re-run.")
+
+
+        
 
     #This function performs the actual control for IK method
     def lowLevelControllerIK(x, y, z):
@@ -1325,6 +1407,8 @@ def buildScene1(use_keyboard_gamepad=False):
         if call_counter == 1: # This prevents the function from double calls
             try:
                 print("\nBUCKET TIP CURRENT LOCATION: ", excavator.bucket_body.getPosition()) #It helps to know bucket location
+                print("\nUNCDERCARRIAGE CURRENT LOCATION: ", excavator.under_carriage_body.getPosition()) #It helps to know undercarriage location
+
                 print("\nPREVIOUSLY GIVEN TARGET COORDINATES: " + str(prev_x), str(prev_y), str(prev_z))
                 xx, yy, zz = map(float, input("\nGive x, y and z coordinates separated with an empty space: \n").split())
                 # Create a visual target
@@ -1333,7 +1417,15 @@ def buildScene1(use_keyboard_gamepad=False):
                 solver = input("Press f for forward kinematics, i for inverse kinematics, or v for velocity control: \n").lower()
                 #Clear previous balls (WIP)
                 #simulation().removeObject()
-                
+
+                # Publish the target coordinates to ROS2 for Unreal Engine
+
+                publisher_pos = agxROS2.PublisherStdMsgsFloat64MultiArray("target_position")
+
+                msgSend = agxROS2.StdMsgsFloat64MultiArray()
+                msgSend.data = [xx, yy, zz]
+                publisher_pos.sendMessage(msgSend)
+
                 
                 #Activate selected kinematic solver and pass the coordinates to the controller
                 if solver.lower() == "i":
