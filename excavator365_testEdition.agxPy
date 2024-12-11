@@ -77,6 +77,8 @@ import csv
 import random
 import agxIO
 
+import agxUtil
+
 # Import ROS2
 import agxROS2
 
@@ -663,26 +665,29 @@ def buildScene1(use_keyboard_gamepad=False):
         :param root: The root node for visualization
         :return: The created marker rigid body
         """
-        # Define the radius for the marker sphere
+
         radius = 0.15
         
-        # Create the geometry for the marker sphere
-        marker_geometry = agxCollide.Geometry(agxCollide.Sphere(radius))
-        
         # Create the rigid body for the marker and add the geometry
+        marker_geometry = agxCollide.Geometry(agxCollide.Sphere(radius))
+
         marker_body = agx.RigidBody(marker_geometry)
+        
         
         # Set the marker to a static state since it's a visual indicator
         marker_body.setMotionControl(agx.RigidBody.STATIC)
         
         # Set the marker's position
         marker_body.setPosition(x, y, z)
-        
+
+        # Disable collision for the geometry by ignoring collisions
+        marker_geometry.setEnableCollisions(False)
+
         # Add the marker to the simulation
         sim.add(marker_body)
         
         # Create a visual representation of the marker and add it to the root
-        agxOSG.createVisual(marker_body, root)  # Pass marker_body instead of marker_geometry
+        agxOSG.createVisual(marker_body, root)  # Pass marker_body
         
         # Set the color to red (RGBA)
         agxOSG.setDiffuseColor(marker_body, agxRender.Color(1.0, 0.0, 0.0, 1.0), root)  # Red color
@@ -780,9 +785,9 @@ def buildScene1(use_keyboard_gamepad=False):
 
     # This function will create a velocity profile for the excavator joints
     def computeVelocities(target, kineChain, angles):
-        K = np.matrix([[1.2], [1.2], [1.2]])
-        K_J = np.matrix([[0.8], [-0.8], [0.8], [0.8]])
-        damp = 0.5
+        K = np.matrix([[1.7], [1.7], [1.7]])
+        K_J = np.matrix([[0.42], [-0.7], [0.7], [0.7]]) # ATTENTION: Value 0.4 for the first joint (cabin) works really well!
+        damp = 0.1
 
         # Initialize angles
         q = angles
@@ -813,7 +818,7 @@ def buildScene1(use_keyboard_gamepad=False):
         bucket_world_frame = excavator.bucket_body.getTransform() # Bucket's world frame
 
         # Now we need bucket's transformation in excavator's body frame as well
-        x_current = excavator_body_transform_inv*bucket_world_frame
+        x_current = bucket_world_frame * excavator_body_transform_inv
 
         #print("X_CURRENT (BODY FRAME):", x_current)
         print("")
@@ -871,7 +876,7 @@ def buildScene1(use_keyboard_gamepad=False):
 
     
     # This function performs velocity control by utilizing computeVelocities and a kinematic chain that updates motion.
-    def compVel(x,y,z, tolerance, repetitions): # Flag detemriens whether simulation values are in Unreal or AGX
+    def compVel(x,y,z, tolerance, repetitions):
 
         # Setup kinematic chain of the relevant components that will partake in calculated motion
         chain = agxModel.SerialKinematicChain(simulation(), excavator.under_carriage_body, excavator.bucket_body)
@@ -891,28 +896,57 @@ def buildScene1(use_keyboard_gamepad=False):
 
         # Target position in world coordinates
         target_in_world = agx.Vec3(x, y, z)
+        '''
+        
+        x_next = agx.Vec3(x, y, z)
 
+        r_next = agx.Quat(0, agx.Vec3.X_AXIS())
+
+        undercarriage_transform = excavator.under_carriage_body.getTransform()
+        bucket_world_pos = excavator.bucket_body.getTransform().getTranslate() # Bucket's world position
+        error = (target_in_world - bucket_world_pos)
+        excavator_body_transform = excavator.under_carriage_body.getTransform()
+        excavator_body_transform_inv = excavator_body_transform.inverse()
+        target_in_body_frame = target_transformation_matrix * excavator_body_transform_inv
+        bucket_in_body_frame = excavator.bucket_body.getTransform() * excavator_body_transform_inv
+        target_transformation_matrix = agx.AffineMatrix4x4(r_next, x_next)
+        '''
+        
         # First we will transform target from world frame to excavator's kinematic chain's base frame
         excavator_body_transform = excavator.under_carriage_body.getTransform()
         excavator_body_transform_inv = excavator_body_transform.inverse()
         print("EXCAVATOR BODY TRANSFORM:", excavator_body_transform, "\n")
+        print("EXCAVATOR BODY TRANSFORM INVERSE:", excavator_body_transform_inv, "\n")
         # Create custom transformation matrix for the target
-        target_transformation_matrix = np.matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [x, y, z, 1]])
-        target_in_body_frame = excavator_body_transform_inv*target_transformation_matrix
+        # target_transformation_matrix = np.matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [x, y, z, 1]])
+
+        x_next = agx.Vec3(x, y, z)
+        r_next = agx.Quat(0, agx.Vec3.X_AXIS())
+        target_transformation_matrix = agx.AffineMatrix4x4(r_next, x_next)
+        target_in_body_frame = target_transformation_matrix * excavator_body_transform_inv
+
         # Position of target in base frame
         target_in_body_pos = np.array([target_in_body_frame[3,0], target_in_body_frame[3,1], target_in_body_frame[3,2]])
-        print("EXCAVATOR BODY TRANSFORM INVERSE:", excavator_body_transform_inv, "\n")
+        
+
+        
 
         # Now we get the location of excavator's bucket
         bucket_world_pos = excavator.bucket_body.getTransform().getTranslate() # Bucket's world position
+        bucket_world_frame = excavator.bucket_body.getTransform()
 
         # Now we need bucket's position in excavator's body frame as well
-        bucket_in_body_frame = excavator_body_transform_inv*bucket_world_pos
+        bucket_in_body_frame = bucket_world_frame * excavator_body_transform_inv
+        bucket_in_body_pos = np.array([bucket_in_body_frame[3,0], bucket_in_body_frame[3,1], bucket_in_body_frame[3,2]])
 
         # Then we need distance (aka error) between bucket and goal
         error = (target_in_world - bucket_world_pos)
-        print("\nDISTANCE FROM THE TARGET: ", error.length())
+        print("\nDISTANCE FROM THE TARGET: ", error)
         print("")
+        # Then we also need distance (aka error) between bucket and goal in body frame
+        body_error = (target_in_body_pos - bucket_in_body_pos)
+        print("\nDISTANCE FROM THE TARGET (BODY FRAME): ", body_error)
+
 
         # Check if already within tolerance (e.g. if user gives point too close to the bucket)
         if error.length() < tolerance:
@@ -933,16 +967,18 @@ def buildScene1(use_keyboard_gamepad=False):
                 angles.append(angle)
                 #print(f"Joint {name}: Angle: {angle}\n")
 
+
+            ##################################
             # Update the frames and recalculate the error
             bucket_world_frame = excavator.bucket_body.getTransform()
-            bucket_in_body_frame = excavator_body_transform_inv*bucket_world_frame
+            bucket_in_body_frame = bucket_world_frame * excavator_body_transform_inv
             #print("\nTARGET IN BODY FRAME:", target_in_body_frame)
             #print("\nBUCKET IN BODY FRAME:", bucket_in_body_frame)
             
-            bucket_in_body_np = np.array([bucket_in_body_frame[3,0], bucket_in_body_frame[3,1], bucket_in_body_frame[3,2]])
+            bucket_in_body_pos = np.array([bucket_in_body_frame[3,0], bucket_in_body_frame[3,1], bucket_in_body_frame[3,2]])
 
-            error_b = (target_in_body_pos - bucket_in_body_np)
-            distance = np.linalg.norm(error_b)
+            error_body = (target_in_body_pos - bucket_in_body_pos)
+            distance = np.linalg.norm(error_body)
 
             # Update world positions
             bucket_world_pos = excavator.bucket_body.getTransform().getTranslate() # Bucket's world position
@@ -951,15 +987,21 @@ def buildScene1(use_keyboard_gamepad=False):
             excavator_body_transform_inv = excavator_body_transform.inverse()
             # print("EXCAVATOR BODY TRANSFORM:", excavator_body_transform, "\n")
             # Create custom transformation matrix for the target
-            target_transformation_matrix = np.matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [x, y, z, 1]])
-            target_in_body_frame = excavator_body_transform_inv*target_transformation_matrix
+            #target_transformation_matrix = np.matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [x, y, z, 1]])
+
+
+            x_next = agx.Vec3(x, y, z)
+            r_next = agx.Quat(0, agx.Vec3.X_AXIS())
+            target_transformation_matrix = agx.AffineMatrix4x4(r_next, x_next)
+
+            target_in_body_frame = target_transformation_matrix * excavator_body_transform_inv
             # Position of target in base frame
             target_in_body_pos = np.array([target_in_body_frame[3,0], target_in_body_frame[3,1], target_in_body_frame[3,2]])
             # print("EXCAVATOR BODY TRANSFORM INVERSE:", excavator_body_transform_inv, "\n")
 
             print("\nUpdated Distance to Target (BASE FRAME): ", distance)
             print("\nUpdated Distance to Target (WORLD FRAME): ", error.length())
-
+            #####################################################
             # Get new speed profiles for the joints
             q_dot_cmd = computeVelocities(target_in_body_pos, chain, angles)
 
@@ -973,7 +1015,7 @@ def buildScene1(use_keyboard_gamepad=False):
             simulation().add(machine_controller)
             # Advance the simulation by one step
             simulation().stepForward()
-            time.sleep(1)
+            time.sleep(0.01)
         
             retries += 1
 
@@ -994,7 +1036,7 @@ def buildScene1(use_keyboard_gamepad=False):
 
             # Print bucket's location for debugging
             print("\nBucket's position in world space:\n", bucket_world_pos)
-            print("\nBucket's position in base frame: \n", bucket_in_body_np)
+            print("\nBucket's position in base frame: \n", bucket_in_body_pos)
 
             if distance < tolerance:
                 print(f"\n=== TARGET REACHED AFTER {retries} REPETITIONS! ===")
@@ -1209,18 +1251,21 @@ def buildScene1(use_keyboard_gamepad=False):
 
         # Target position in world coordinates
         target_in_world = agx.Vec3(x, y, z)
+        x_next = agx.Vec3(x, y, z)
+        r_next = agx.Quat(0, agx.Vec3.X_AXIS())
+        target_transformation_matrix = agx.AffineMatrix4x4(r_next, x_next)
 
         # Get bucket's transformation in world coordinates
         bucket_transform_world = excavator.bucket_body.getTransform()  # Transformation matrix of bucket in world frame
         bucket_transform_inv = bucket_transform_world.inverse() # Inverse of the transformation matrix
         bucket_origin_world = bucket_transform_world.getTranslate()  # Bucket's world position
 
-        target_local = bucket_transform_inv * target_in_world # Target coordinates in bucket's coordinate frame
+        target_local = target_transformation_matrix * bucket_transform_inv # Target coordinates in bucket's coordinate frame
 
         # Target position and rotation
         #x_d = agx.Vec3(x, y, z)
-        rot_d = agx.Quat(1, 0, 0, 0)  # Identity rotation, or specify a desired rotation if needed
-        X_d = agx.AffineMatrix4x4(rot_d, target_local)
+        #rot_d = agx.Quat(1, 0, 0, 0)  # Identity rotation, or specify a desired rotation if needed
+        X_d = target_local
 
         distance = (target_in_world - bucket_origin_world).length() # The distance between bucket and goal
         print("\nDISTANCE FROM THE TARGET: ", distance)
@@ -1272,7 +1317,7 @@ def buildScene1(use_keyboard_gamepad=False):
         return tempChain
     
     # This function performs low-level control with joint velocities
-    def velocityController(x, y, z, tolerance = 0.03, repetitions = 10):
+    def velocityController(x, y, z, tolerance = 0.05, repetitions = 1000):
 
         # Print crucial information before choosing the computational method later
         bucket_position = excavator.bucket_body.getPosition()
@@ -1281,15 +1326,32 @@ def buildScene1(use_keyboard_gamepad=False):
 
         ###########################################################
         # Frame computations
+        x_next = agx.Vec3(x, y, z)
+        r_next = agx.Quat(0, agx.Vec3.X_AXIS())
+        target_transformation_matrix = agx.AffineMatrix4x4(r_next, x_next)
+
         undercarriage_transform = excavator.under_carriage_body.getTransform()
         bucket_world_pos = excavator.bucket_body.getTransform().getTranslate() # Bucket's world position
         error = (target_in_world - bucket_world_pos)
         excavator_body_transform = excavator.under_carriage_body.getTransform()
         excavator_body_transform_inv = excavator_body_transform.inverse()
+        
+        target_in_body_frame = target_transformation_matrix * excavator_body_transform_inv
+        bucket_in_body_frame = excavator.bucket_body.getTransform() * excavator_body_transform_inv
+        
+
         # print("EXCAVATOR BODY TRANSFORM:", excavator_body_transform, "\n")
         # Create custom transformation matrix for the target
-        target_transformation_matrix = np.matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [x, y, z, 1]])
-        target_in_body_frame = excavator_body_transform_inv*target_transformation_matrix
+       # target_transformation_matrix = np.matrix([[1, 0, 0, 0], [0, 1, 0, 0], [0, 0, 1, 0], [x, y, z, 1]])
+
+        
+
+        # Apply the next pose to the target geometry for visualization.
+        print("\nTARGET TRANSFORM IN WORLD: \n", target_transformation_matrix, "\n")
+        print("TARGET TRANSFORM IN BODY: \n", target_in_body_frame, "\n")
+        print("BUCKET TRANSFORM IN World: \n", excavator.bucket_body.getTransform(), "\n")
+        print("BUCKET TRANSFORM IN BODY: \n", bucket_in_body_frame, "\n")
+
         # Position of target in base frame
         target_in_body_pos = np.array([target_in_body_frame[3,0], target_in_body_frame[3,1], target_in_body_frame[3,2]])
 
