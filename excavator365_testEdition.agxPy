@@ -85,6 +85,15 @@ import agxROS2
 # Libraries
 import time
 
+# Initialize ROS2 publishers and subscribers
+publisher_pos = agxROS2.PublisherGeometryMsgsVector3("target_position")
+publisher_vel = agxROS2.PublisherStdMsgsFloat64MultiArray("vel_cmd")
+subscriber = agxROS2.SubscriberSensorMsgsJointState("/joint_states")
+dummy_subscriber = agxROS2.SubscriberStdMsgsEmpty("dummy_msg")
+subscriber_joints = agxROS2.SubscriberStdMsgsFloat64MultiArray("joint_positions")
+subscriber_target = agxROS2.SubscriberStdMsgsFloat64MultiArray("target_in_body_pos")
+
+
 paths = ["/data/python/agxTerrain", "/data/python/"]
 for p in paths:
     folder_path = os.getenv("AGX_DIR") + p
@@ -649,6 +658,8 @@ def buildScene1(use_keyboard_gamepad=False):
 
     # Initialize the angles of the excavator joints
     default_controller = JointControllerAutomatic(excavator)
+    # Empty vector for storing joint angles of the Unreal Engine excavator
+    unrealAngles = agx.RealVector()
 
     ###################################################################################
 
@@ -786,7 +797,7 @@ def buildScene1(use_keyboard_gamepad=False):
     # This function will create a velocity profile for the excavator joints
     def computeVelocities(target, kineChain, angles):
         K = np.matrix([[1.7], [1.7], [1.7]])
-        K_J = np.matrix([[0.42], [-0.7], [0.7], [0.7]]) # ATTENTION: Value 0.4 for the first joint (cabin) works really well!
+        K_J = np.matrix([[0.42], [-0.7], [0.7], [0.7]]) # ATTENTION: Value 0.42 (and 0.7 for others) for the first joint (cabin) works really well!
         damp = 0.1
 
         # Initialize angles
@@ -872,9 +883,15 @@ def buildScene1(use_keyboard_gamepad=False):
         #sendJointVelocities(q_dot)
 
         # Wait for next control cycle
-        #wait(control_loop_period)
+        #wait(control_loop_period)    
+    def parseROS2Data():
+        msgReceive = agxROS2.SensorMsgsJointState()
+        subscriber.receiveMessage(msgReceive)
+        joint_angles = agx.RealVector()
+        print("GOT UNREAL DATA::: ", msgReceive.position)
+        time.sleep(5.0)
 
-    
+        
     # This function performs velocity control by utilizing computeVelocities and a kinematic chain that updates motion.
     def compVel(x,y,z, tolerance, repetitions):
 
@@ -885,6 +902,7 @@ def buildScene1(use_keyboard_gamepad=False):
 
         #printKinematicChain(chain) #Dissect the kinematic chain
 
+        # ROS2 (velocity) publisher and (joint angle) subscribe
 
         # Initialize private model with the controller class
         machine_controller = default_controller
@@ -927,9 +945,6 @@ def buildScene1(use_keyboard_gamepad=False):
 
         # Position of target in base frame
         target_in_body_pos = np.array([target_in_body_frame[3,0], target_in_body_frame[3,1], target_in_body_frame[3,2]])
-        
-
-        
 
         # Now we get the location of excavator's bucket
         bucket_world_pos = excavator.bucket_body.getTransform().getTranslate() # Bucket's world position
@@ -956,16 +971,47 @@ def buildScene1(use_keyboard_gamepad=False):
         #print("\nTARGET IN BODY:", target_in_body_frame)
         print("")
         #print("\nTARGET IN WORLD FRAME:", target_in_world, "\n")
+
+        # Create a timer and set it for measuring execution time
+        myTimer  = agx.Timer()
+        usingUnrealValues = False # Flag that will prevent simulation from alternating between AGX and ROS2 values
         
         # Now we loop the velocity controller until target is reached within the tolerance
         while retries < repetitions:
+            # Start the timer
+            duration = 0
+            myTimer.start()
 
-            # Update the angles
-            angles.clear()
-            for name in machine_controller.constraints:
-                angle = machine_controller.constraints[name].getAngle()  # Get the angle for each joint
-                angles.append(angle)
-                #print(f"Joint {name}: Angle: {angle}\n")
+            # Update the angles if ROS2 subscriber returns empty
+            msgTargetReceive = agxROS2.StdMsgsFloat64MultiArray()
+
+            # Target position in Unreal Engine (base frame)
+            msg_jointReceive = agxROS2.StdMsgsFloat64MultiArray()
+
+            if subscriber_joints.receiveMessage(msg_jointReceive):
+                usingUnrealValues = True
+                print("\n===USING UNREAL VALUES!!! ===\n")
+                angles.clear()
+                tempAngles = msg_jointReceive.data
+
+                for i in tempAngles:
+                    unrealAngles.append(i)
+                print("\nReceived message: {}".format(msg_jointReceive.data), "\n")
+                angles = unrealAngles
+
+            else: # Use agx angles to perform the simulation
+                if(not usingUnrealValues):
+                    angles.clear()
+                    for name in machine_controller.constraints:
+                        angle = machine_controller.constraints[name].getAngle()  # Get the angle for each joint
+                        angles.append(angle)
+                        #print(f"Joint {name}: Angle: {angle}\n")
+                    #print("Did not receive a message.")
+                else:
+                    print("\nFATAL ERROR HAS OCCURRED!\n")
+                    angles = unrealAngles
+
+
 
 
             ##################################
@@ -1003,6 +1049,13 @@ def buildScene1(use_keyboard_gamepad=False):
             print("\nUpdated Distance to Target (WORLD FRAME): ", error.length())
             #####################################################
             # Get new speed profiles for the joints
+            if subscriber_target.receiveMessage(msgTargetReceive):
+                target_in_body_pos_unreal = msgTargetReceive.data
+                target_in_body_pos = target_in_body_pos_unreal
+            
+            elif usingUnrealValues:
+                target_in_body_pos = target_in_body_pos_unreal
+
             q_dot_cmd = computeVelocities(target_in_body_pos, chain, angles)
 
             if len(q_dot_cmd) == 0:
@@ -1015,6 +1068,7 @@ def buildScene1(use_keyboard_gamepad=False):
             simulation().add(machine_controller)
             # Advance the simulation by one step
             simulation().stepForward()
+
             time.sleep(0.01)
         
             retries += 1
@@ -1025,12 +1079,9 @@ def buildScene1(use_keyboard_gamepad=False):
             vel_cmds = q_dot_cmd.flatten().tolist()[0]
             print(vel_cmds)
 
-
-            publisher = agxROS2.PublisherStdMsgsFloat64MultiArray("vel_cmd")
-
             msgSend = agxROS2.StdMsgsFloat64MultiArray()
             msgSend.data = q_dot_cmd.flatten().tolist()[0]
-            publisher.sendMessage(msgSend)
+            publisher_vel.sendMessage(msgSend)
 
             ######################################################################
 
@@ -1044,12 +1095,14 @@ def buildScene1(use_keyboard_gamepad=False):
                 msgSend.data = [0,0,0,0]
                 print("ROS2 data:", msgSend.data)
                 time.sleep(1)
-                publisher.sendMessage(msgSend)
+                publisher_vel.sendMessage(msgSend)
                 zeroSpeeds = np.zeros_like(q_dot_cmd)
                 machine_controller.targetVelocity(zeroSpeeds)
                 simulation().add(machine_controller)
                 # Advance the simulation by one step
                 simulation().stepForward()
+                duration = myTimer.getTime()
+                print("\n=#=#=#= It took", duration / 1000, "seconds to solve it! =#=#=#=\n")
                 return
             
             elif retries >= repetitions:
@@ -1057,13 +1110,15 @@ def buildScene1(use_keyboard_gamepad=False):
                 # LOCK ROS2 joints
                 msgSend.data = [0,0,0,0]
                 time.sleep(1)
-                publisher.sendMessage(msgSend)
+                publisher_vel.sendMessage(msgSend)
                 print("ROS2 data:", msgSend.data)
                 zeroSpeeds = np.zeros_like(q_dot_cmd)
                 machine_controller.targetVelocity(zeroSpeeds)
                 simulation().add(machine_controller)
                 # Advance the simulation by one step
                 simulation().stepForward()
+                duration = myTimer.getTime()
+                print("\n=#=#=#= It took", duration / 1000, "seconds to solve it! =#=#=#=\n")
                 return
 
 
@@ -1482,13 +1537,16 @@ def buildScene1(use_keyboard_gamepad=False):
 
                 # Publish the target coordinates to ROS2 for Unreal Engine
 
-                publisher_pos = agxROS2.PublisherStdMsgsFloat64MultiArray("target_position")
+                msgSend = agxROS2.GeometryMsgsVector3()
+                msgSend.x = xx
+                msgSend.y = yy
+                msgSend.z = zz
 
-                msgSend = agxROS2.StdMsgsFloat64MultiArray()
-                msgSend.data = [xx, yy, zz]
+
+                print("\nMESSAGE TARGET DATA:", msgSend.x, msgSend.y, msgSend.z, "\n")
+
                 publisher_pos.sendMessage(msgSend)
 
-                
                 #Activate selected kinematic solver and pass the coordinates to the controller
                 if solver.lower() == "i":
                     
