@@ -417,13 +417,19 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         self.done = False
         self.myTimer = agx.Timer()
         self.visual_trace = []
-        self.timeLimit = 15000
+        self.timeLimit = 25000
         self.closestDistance = None
         self.visual_trace_target = []
         self.q_dot_cmd_gained = []
 
         self.targetReached = False
         self.usingDynamicGains = True
+        self.target = None
+        self.duration = 10000
+
+        #=#=#=#=#=#
+        self.moveFlag = False # Manually change this if you want trajectory following
+        #=#=#=#=#=#
 
         self.current_index = 0
         self.constraints = collections.OrderedDict()
@@ -512,7 +518,8 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         target_transformation_matrix = agx.AffineMatrix4x4(r_next, x_next)
         target_in_body_frame = target_transformation_matrix * excavator_body_transform_inv
 
-
+        if self.moveFlag:
+            self.create_red_marker(self.targetPose[0], self.targetPose[1], self.targetPose[2], simulation(), root())
         # Position of target in base frame
         target_in_body_pos = np.array([target_in_body_frame[3,0], target_in_body_frame[3,1], target_in_body_frame[3,2]])
 
@@ -551,29 +558,51 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
 
         # We will vary the gains based on how far away the bucket is from the target if dynamic gains are enabled
         if(np.sum(np.abs(self.distance_error)) > self.tolerance * 100 and self.usingDynamicGains):
-            K = np.matrix([[0.7], [0.7], [0.7]])
-            K_J = np.matrix([[0.7], [-0.7], [0.5], [0.5]])
+            K = np.matrix([[0.7], [0.7], [0.7]]) # Positional gain
+            K_J = np.matrix([[1], [-0.7], [0.5], [0.5]]) # Joint velocity gain
+            K_R = np.matrix([[0.5], [0.5], [0.5]]) # Rotational gain
             
         else:
-            K = np.matrix([[1], [1], [1]])
-            K_J = np.matrix([[1], [-1.2], [1.2], [1.2]])
+            K = np.matrix([[1.2], [1.2], [1.2]])
+            K_J = np.matrix([[1.2], [-1.0], [1.0], [1.0]])
+            K_R = np.matrix([[0], [0], [0]])
 
 
-        x_desired = target_in_body_pos # Target in base (body) frame
+        ###############################################################################
+        # Compute both position and orientation error
+        # Make the target move
 
-        # Compute error (convert to numpy for manipulation)
-        # Convert Vec3 to numpy arrays for subtraction
-        x_desired_np = np.array([x_desired[0], x_desired[1], x_desired[2]])
-        # Now we need bucket's transformation in excavator's body frame as well
-        x_current_np = bucket_in_body_pos
+        # First manually create transformation matrix for the bucket in body frame
+        bucket_next = [bucket_in_body_frame[3,0], bucket_in_body_frame[3,1], bucket_in_body_frame[3,2]]
+        bucket_next = agx.Vec3(bucket_next[0], bucket_next[1], bucket_next[2])
+        r_next = agx.Quat(0, agx.Vec3.X_AXIS())
+        bucket_body_trans = agx.AffineMatrix4x4(r_next, bucket_next)
+
+        if self.moveFlag:
+            if time < self.duration:
+                X_d = self.move_target(time, x_0=bucket_body_trans, pos = bucket_in_body_pos)
+            else:
+                X_d = target_in_body_frame
+        else:
+            X_d = target_in_body_frame
         
-        # Compute the error (now a numpy array)
-        e = np.subtract(x_desired_np,x_current_np)
+        X = bucket_in_body_frame
 
-        self.done = np.sum(np.abs(e)) < self.tolerance
+        pos_rot_error = self.angle_axis_error(X, X_d)
+        e = pos_rot_error
+        print("\n#=#=#=#=#=#=#\nERROR MATRIX:\n", e, "\n#=#=#=#=#=#=#\n")
+
+        ###############################################################################
+        
+        # Compute the error while ignoring rotation if target is close enough
+        #e = [pos_rot_error[0], pos_rot_error[1], pos_rot_error[2], 0, 0, 0] # Test to see whether angle_axis_error works without angular values
+        
+        distance_error_vector = [pos_rot_error[0], pos_rot_error[1], pos_rot_error[2], 0, 0, 0]
+
+        self.done = np.sum(np.abs(distance_error_vector)) < self.tolerance
 
         # Compute desired end-effector velocity
-        x_dot_desired = np.matrix([[K[0, 0] * e[0]], [K[1, 0] * e[1]], [K[2, 0] * e[2]], [0], [0], [0]])  # 6 x 1 vector
+        x_dot_desired = np.matrix([[K[0, 0] * e[0]], [K[1, 0] * e[1]], [K[2, 0] * e[2]], [K_R[0, 0] * e[3]], [K_R[1, 0] * e[4]], [K_R[2, 0] * e[5]]])  # 6 x 1 vector
 
         q = self.getJointAngles()
 
@@ -595,8 +624,8 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         
         #print("\nJacobian array:", jacobian_array)
 
-        # Compute pseudo-inverse of Jacobian using DLS
-        J_pseudo = self.computePseudoInverse(jacobian_array) # n x m matrix
+        # Compute pseudo-inverse of Jacobian (we are using built in pinv instead of our own DLS function)
+        J_pseudo = np.linalg.pinv(jacobian_array) # n x m matrix
 
         # Compute joint velocities
         q_dot_cmd = J_pseudo @ x_dot_desired # n x 1 vector
@@ -624,9 +653,12 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
             self.visual_trace.clear()  # Clear the list after removing the spheres
             
             # Remove the target visual spheres
+            """
+            # Remove the target visual spheres
             for sphere in self.visual_trace_target:
                 simulation().remove(sphere)
             self.visual_trace_target.clear() # Clear the list after removing the spheres
+            """
             ####################################
             simulation().remove(self)
 
@@ -641,15 +673,96 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
             for sphere in self.visual_trace:
                 simulation().remove(sphere)
             self.visual_trace.clear()  # Clear the list after removing the spheres
-            
+            """
             # Remove the target visual spheres
             for sphere in self.visual_trace_target:
                 simulation().remove(sphere)
             self.visual_trace_target.clear() # Clear the list after removing the spheres
+            """
             ####################################
             simulation().remove(self)
 
+    def move_target(self, time, radius=0.2, omega=0.3 * np.pi, x_0 = None, pos = None):
+        '''
+        Translate the target in a circle while also rotating it.
+        '''
+        x = pos[0]
+        y = pos[1] + radius * np.cos(omega * time)
+        z = pos[2] + radius * np.sin(omega * time)
+        x_next = agx.Vec3(x, y, z)
 
+        r_next = x_0.getRotate() * agx.Quat(0.3 * omega * time, agx.Vec3.X_AXIS())
+
+        # Apply the next pose to the target geometry for visualization.
+        X_next = agx.AffineMatrix4x4(r_next, x_next)
+        self.target.getFrame().setMatrix(X_next)
+
+        return X_next
+    
+    def create_red_marker(self, x, y, z, sim, root):
+        """
+        Creates a small red marker sphere at the specified (x, y, z) coordinates.
+
+        :param x: X-coordinate of the marker
+        :param y: Y-coordinate of the marker
+        :param z: Z-coordinate of the marker
+        :param sim: The simulation to which the marker will be added
+        :param root: The root node for visualization
+        :return: The created marker rigid body
+        """
+
+        radius = 0.15
+        
+        # Create the rigid body for the marker and add the geometry
+        marker_geometry = agxCollide.Geometry(agxCollide.Sphere(radius))
+
+        marker_body = agx.RigidBody(marker_geometry)
+        
+        
+        # Set the marker to a static state since it's a visual indicator
+        marker_body.setMotionControl(agx.RigidBody.STATIC)
+        
+        # Set the marker's position
+        marker_body.setPosition(x, y, z)
+
+        # Disable collision for the geometry by ignoring collisions
+        marker_geometry.setEnableCollisions(False)
+
+        # Add the marker to the simulation
+        sim.add(marker_body)
+        
+        # Create a visual representation of the marker and add it to the root
+        agxOSG.createVisual(marker_body, root)  # Pass marker_body
+        
+        # Set the color to red (RGBA)
+        agxOSG.setDiffuseColor(marker_body, agxRender.Color(1.0, 0.0, 0.0, 1.0), root)  # Red color
+
+        self.target = marker_body
+        
+
+    def angle_axis_error(self, X: agx.AffineMatrix4x4, X_d: agx.AffineMatrix4x4):
+        '''
+        Computes the 6-vector error between two poses. Translational is straight-forward and
+        orientation uses quaternions to angle-axis error.
+        '''
+        # Position error
+        x_d = np.array([*X_d.getTranslate()])
+        x = np.array([*X.getTranslate()])
+        x_err = x_d - x
+
+        # orientation error using angle axis
+        quat = agx.Quat(X)
+        quat_d = agx.Quat(X_d)
+        quat_err = quat.inverse() * quat_d # ORIGINALLY quat.inverse() * quat_d
+
+        angle_err = quat_err.getAngle()
+        angle_err = (angle_err + np.pi) % (2 * np.pi) - np.pi  # get into [-pi, pi]
+        axis_err = np.array([*quat_err.getUnitVector()])
+
+        r_err = axis_err * angle_err
+
+        # stack as 6-vector
+        return np.hstack((x_err, r_err))
     
     def post(self, time):
         # Visualize the motion of the end-effector
@@ -792,9 +905,16 @@ def buildScene1(use_keyboard_gamepad=False):
 
     def start_TaskSpaceController():
         global call_counter
+        global prev_x, prev_y, prev_z
+
         if call_counter == 1: # This prevents the function from double calls
             print("\nBUCKET LOCATION IN WORLD FRAME:", excavator.bucket_body.getPosition())
+            print("\nPREVIOUSLY GIVEN TARGET COORDINATES: " + str(prev_x), str(prev_y), str(prev_z))
             xx, yy, zz = map(float, input("\nGive x, y and z coordinates separated with an empty space: \n").split())
+            # Save the target coordinates for later
+            prev_x = xx
+            prev_y = yy
+            prev_z = zz
             targetPose = agx.Vec3(xx,yy,zz)
             # Setup kinematic chain of the relevant components that will partake in calculated motion
             chain = agxModel.SerialKinematicChain(simulation(), excavator.under_carriage_body, excavator.bucket_body)
