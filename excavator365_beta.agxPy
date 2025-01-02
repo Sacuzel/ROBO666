@@ -553,7 +553,6 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
             return
         
         #########################################################################################
-        
         # Now the control mathematics
 
         # We will vary the gains based on how far away the bucket is from the target if dynamic gains are enabled
@@ -562,7 +561,7 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
             K_J = np.matrix([[1], [-0.7], [0.5], [0.5]]) # Joint velocity gain
             K_R = np.matrix([[0.5], [0.5], [0.5]]) # Rotational gain
             
-        else:
+        else: # Dynamic gains kick in when target is close enough
             K = np.matrix([[1.2], [1.2], [1.2]])
             K_J = np.matrix([[1.2], [-1.0], [1.0], [1.0]])
             K_R = np.matrix([[0], [0], [0]])
@@ -578,7 +577,7 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         r_next = agx.Quat(0, agx.Vec3.X_AXIS())
         bucket_body_trans = agx.AffineMatrix4x4(r_next, bucket_next)
 
-        if self.moveFlag:
+        if self.moveFlag: # If we want the target to move
             if time < self.duration:
                 X_d = self.move_target(time, x_0=bucket_body_trans, pos = bucket_in_body_pos)
             else:
@@ -593,8 +592,8 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         print("\n#=#=#=#=#=#=#\nERROR MATRIX:\n", e, "\n#=#=#=#=#=#=#\n")
 
         ###############################################################################
-        
         # Compute the error while ignoring rotation if target is close enough
+        
         #e = [pos_rot_error[0], pos_rot_error[1], pos_rot_error[2], 0, 0, 0] # Test to see whether angle_axis_error works without angular values
         
         distance_error_vector = [pos_rot_error[0], pos_rot_error[1], pos_rot_error[2], 0, 0, 0]
@@ -615,7 +614,9 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         # Compute the inverse of the Jacobian
 
         # The jacobian is an agx.RealVector with 6xN size
-        jacobian_array = np.zeros((6, len(q)))  # Create a 6xN matrix
+        # We need the jacobian as numpy matrix
+
+        jacobian_array = np.zeros((6, len(q)))  # First create a 6xN matrix
 
         # Copy values from the agx.RealVector to the numpy matrix
         for j in range(6):
@@ -624,7 +625,8 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         
         #print("\nJacobian array:", jacobian_array)
 
-        # Compute pseudo-inverse of Jacobian (we are using built in pinv instead of our own DLS function)
+        # Compute pseudo-inverse of Jacobian (we are using built in pinv instead of 
+        # our own DLS function as we don't need the dampening after all)
         J_pseudo = np.linalg.pinv(jacobian_array) # n x m matrix
 
         # Compute joint velocities
