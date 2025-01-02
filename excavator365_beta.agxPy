@@ -88,11 +88,8 @@ import time
 # Initialize ROS2 publishers and subscribers
 publisher_pos = agxROS2.PublisherGeometryMsgsVector3("target_position")
 publisher_vel = agxROS2.PublisherStdMsgsFloat64MultiArray("vel_cmd")
-subscriber = agxROS2.SubscriberSensorMsgsJointState("/joint_states")
-dummy_subscriber = agxROS2.SubscriberStdMsgsEmpty("dummy_msg")
-subscriber_joints = agxROS2.SubscriberStdMsgsFloat64MultiArray("joint_positions")
-subscriber_target = agxROS2.SubscriberStdMsgsFloat64MultiArray("target_in_body_pos")
-
+subscriber_joints = agxROS2.SubscriberSensorMsgsJointState("joint_states")
+subscriber_bucket_and_carriage_pos = agxROS2.SubscriberStdMsgsFloat64MultiArray("bucket_and_carriage")
 
 paths = ["/data/python/agxTerrain", "/data/python/"]
 for p in paths:
@@ -423,9 +420,14 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         self.q_dot_cmd_gained = []
 
         self.targetReached = False
+        self.usingUnrealValues = False
         self.usingDynamicGains = True
         self.target = None
         self.duration = 10000
+
+        self.previousAngles = collections.OrderedDict()
+        self.previousBucketPos = agx.AffineMatrix4x4()
+        self.previousTargetReceive = agx.AffineMatrix4x4()
 
         #=#=#=#=#=#
         self.moveFlag = False # Manually change this if you want trajectory following
@@ -452,9 +454,38 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
     # Getter and setter for joint angles and velocities
 
     def getJointAngles(self):
+
         angles = collections.OrderedDict()
-        for name in self.constraints:
-            angles[name] = self.constraints[name].getAngle()
+
+        # Update the angles if ROS2 subscriber returns empty
+        # Target joint angles in Unreal Engine (base frame)
+        msg_jointReceive = agxROS2.SensorMsgsJointState()
+
+        if subscriber_joints.receiveMessage(msg_jointReceive):
+            self.usingUnrealValues = True
+            print("\n===USING UNREAL VALUES!!! ===\n")
+            angles.clear()
+            tempAngles = msg_jointReceive.position
+            tempNames = msg_jointReceive.name
+
+            # Add each joint and its respective angle value
+            angles[tempNames[0]] = tempAngles[0]
+            angles[tempNames[1]] = tempAngles[1]
+            angles[tempNames[2]] = tempAngles[2]
+            angles[tempNames[3]] = tempAngles[3]
+
+            self.previousAngles = angles # Save previos values in case ROS2 does not respond immeadiately
+
+        else: # Use agx angles to perform the simulation
+            if(not self.usingUnrealValues):
+                print("\n===USING SYSTEM VALUES!!! ===\n")
+
+                angles.clear()
+                for name in self.constraints:
+                    angles[name] = self.constraints[name].getAngle()
+            else:
+                print("\nUSING PREVIOUS JOINT VALUES!\n")
+                angles = self.previousAngles
         
         return angles
 
@@ -508,6 +539,7 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
     def pre(self, time):
         
         #########################################################################################
+
         # Frame calculations
         # First we will transform target from world frame to excavator's kinematic chain's base frame
         excavator_body_transform = self.excavator.under_carriage_body.getTransform()
@@ -556,15 +588,32 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         # Now the control mathematics
 
         # We will vary the gains based on how far away the bucket is from the target if dynamic gains are enabled
+        
+        """
+        # Unreal engine gains
+        if(np.sum(np.abs(self.distance_error)) > self.tolerance * 100 and self.usingDynamicGains):
+            K = np.matrix([[5], [5], [5]]) # Positional gain
+            K_J = np.matrix([[7], [-5], [4], [4]]) # Joint velocity gain
+            K_R = np.matrix([[4], [4], [4]]) # Rotational gain
+            
+        else: # Dynamic gains kick in when target is close enough
+            K = np.matrix([[6], [6], [6]])
+            K_J = np.matrix([[6], [-7], [5], [5]])
+            K_R = np.matrix([[0], [0], [0]])
+        """
+        
+        #Original gain values for agxDynamics simulation
+
         if(np.sum(np.abs(self.distance_error)) > self.tolerance * 100 and self.usingDynamicGains):
             K = np.matrix([[0.7], [0.7], [0.7]]) # Positional gain
             K_J = np.matrix([[1], [-0.7], [0.5], [0.5]]) # Joint velocity gain
             K_R = np.matrix([[0.5], [0.5], [0.5]]) # Rotational gain
-            
+        
         else: # Dynamic gains kick in when target is close enough
             K = np.matrix([[1.2], [1.2], [1.2]])
             K_J = np.matrix([[1.2], [-1.0], [1.0], [1.0]])
             K_R = np.matrix([[0], [0], [0]])
+        
 
 
         ###############################################################################
@@ -587,6 +636,11 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         
         X = bucket_in_body_frame
 
+        ##########################################################################
+
+
+        ##########################################################################
+
         pos_rot_error = self.angle_axis_error(X, X_d)
         e = pos_rot_error
         print("\n#=#=#=#=#=#=#\nERROR MATRIX:\n", e, "\n#=#=#=#=#=#=#\n")
@@ -597,6 +651,17 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         #e = [pos_rot_error[0], pos_rot_error[1], pos_rot_error[2], 0, 0, 0] # Test to see whether angle_axis_error works without angular values
         
         distance_error_vector = [pos_rot_error[0], pos_rot_error[1], pos_rot_error[2], 0, 0, 0]
+
+        ##########################################################################
+        # IF UNREAL ENGINE IS AVAILABLE
+        # Use ROS2 values for error calculation
+        #msg_targetReceiveInBody = agxROS2.StdMsgsFloat64MultiArray()
+
+        #if subscriber_bucket_in_body.receiveMessage(msg_targetReceiveInBody):
+            #self.usingUnrealValues = True
+            #print("\n=== DISTANCE USING UNREAL VALUES!!! ===\n")
+            #self.done = msg_targetReceiveInBody.data[3] < self.tolerance
+        ##########################################################################
 
         self.done = np.sum(np.abs(distance_error_vector)) < self.tolerance
 
@@ -639,6 +704,17 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
             if abs(value) > 0.7: # Using absolute value to consider both positive and negative values
                 self.q_dot_cmd_gained[index] = 0.4 * value
 
+        ######################################################################
+        # ROS2 process (send velocities to UnrealEngine)
+        
+        vel_cmds = self.q_dot_cmd_gained.flatten().tolist()[0]
+
+        msgSend = agxROS2.StdMsgsFloat64MultiArray()
+        msgSend.data = vel_cmds
+        publisher_vel.sendMessage(msgSend)
+
+        ######################################################################
+
         if not self.done and self.myTimer.getTime() < self.timeLimit:
             self.setTargetVelocity(self.q_dot_cmd_gained)
 
@@ -648,6 +724,11 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
             print("\nTHE CLOSEST ACHIEVED DISTANCE FROM THE TARGET:", self.closestDistance, "\n")
             zeroSpeeds = np.zeros_like(self.q_dot_cmd_gained)
             self.setTargetVelocity(zeroSpeeds)
+
+            ######################################
+            # Send zero speeds to ROS2
+            msgSend.data = [0,0,0,0]
+            publisher_vel.sendMessage(msgSend)
             ####################################
             # Remove the visual trace spheres
             for sphere in self.visual_trace:
@@ -670,6 +751,10 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
             print("\n=#=#=#= TARGET REACHED, it took", duration / 1000, "seconds! =#=#=#=\n")
             zeroSpeeds = np.zeros_like(self.q_dot_cmd_gained)
             self.setTargetVelocity(zeroSpeeds)
+            ######################################
+            # Send zero speeds to ROS2
+            msgSend.data = [0,0,0,0]
+            publisher_vel.sendMessage(msgSend)
             ####################################
             # Remove the visual trace spheres
             for sphere in self.visual_trace:
@@ -918,6 +1003,14 @@ def buildScene1(use_keyboard_gamepad=False):
             prev_y = yy
             prev_z = zz
             targetPose = agx.Vec3(xx,yy,zz)
+
+            # Publish the target coordinates to ROS2 for Unreal Engine
+            msgSend = agxROS2.GeometryMsgsVector3()
+            msgSend.x = xx
+            msgSend.y = yy
+            msgSend.z = zz
+            publisher_pos.sendMessage(msgSend)
+
             # Setup kinematic chain of the relevant components that will partake in calculated motion
             chain = agxModel.SerialKinematicChain(simulation(), excavator.under_carriage_body, excavator.bucket_body)
             if not chain.isValid():
