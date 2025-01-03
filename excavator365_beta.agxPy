@@ -586,34 +586,46 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         
         #########################################################################################
         # Now the control mathematics
-
         # We will vary the gains based on how far away the bucket is from the target if dynamic gains are enabled
-        
-        """
-        # Unreal engine gains
-        if(np.sum(np.abs(self.distance_error)) > self.tolerance * 100 and self.usingDynamicGains):
-            K = np.matrix([[5], [5], [5]]) # Positional gain
-            K_J = np.matrix([[7], [-5], [4], [4]]) # Joint velocity gain
-            K_R = np.matrix([[4], [4], [4]]) # Rotational gain
-            
-        else: # Dynamic gains kick in when target is close enough
-            K = np.matrix([[6], [6], [6]])
-            K_J = np.matrix([[6], [-7], [5], [5]])
-            K_R = np.matrix([[0], [0], [0]])
-        """
-        
-        #Original gain values for agxDynamics simulation
+        # Gain values will be automatically increased if ROS2 connection is available
 
-        if(np.sum(np.abs(self.distance_error)) > self.tolerance * 100 and self.usingDynamicGains):
-            K = np.matrix([[0.7], [0.7], [0.7]]) # Positional gain
-            K_J = np.matrix([[1], [-0.7], [0.5], [0.5]]) # Joint velocity gain
-            K_R = np.matrix([[0.5], [0.5], [0.5]]) # Rotational gain
+        msg_bucketCarriageReceive = agxROS2.StdMsgsFloat64MultiArray()
+
+
+        if subscriber_bucket_and_carriage_pos.receiveMessage(msg_bucketCarriageReceive):
+            print("\n===USING UNREAL GAINS!!! ===\n")
+
+            # We will use Unreal engine gains
+            if(np.sum(np.abs(self.distance_error)) > self.tolerance * 100 and self.usingDynamicGains):
+                K = np.matrix([[5], [5], [5]]) # Positional gain
+                K_J = np.matrix([[7], [-5], [4], [4]]) # Joint velocity gain
+                K_R = np.matrix([[4], [4], [4]]) # Rotational gain
+                
+            else: # Dynamic gains kick in when target is close enough
+                K = np.matrix([[6], [6], [6]])
+                K_J = np.matrix([[6], [-7], [5], [5]])
+                K_R = np.matrix([[0], [0], [0]])
         
-        else: # Dynamic gains kick in when target is close enough
-            K = np.matrix([[1.2], [1.2], [1.2]])
-            K_J = np.matrix([[1.2], [-1.0], [1.0], [1.0]])
-            K_R = np.matrix([[0], [0], [0]])
         
+        # Use original gain values for agxDynamics simulation
+        else:
+            print("\n===USING SYSTEM GAINS!!! ===\n")
+
+            if(np.sum(np.abs(self.distance_error)) > self.tolerance * 100 and self.usingDynamicGains):
+                K = np.matrix([[0.7], [0.7], [0.7]]) # Positional gain
+                K_J = np.matrix([[1], [-0.7], [0.5], [0.5]]) # Joint velocity gain
+                K_R = np.matrix([[0.5], [0.5], [0.5]]) # Rotational gain
+
+            elif(np.sum(np.abs(self.distance_error)) > self.tolerance * 10 and self.usingDynamicGains):
+                K = np.matrix([[1.2], [1.2], [1.2]])
+                K_J = np.matrix([[1.2], [-1.0], [1.0], [1.0]])
+                K_R = np.matrix([[0], [0], [0]])
+            
+            else: # Dynamic gains kick in when target is close enough
+                K = np.matrix([[1.5], [1.5], [1.5]])
+                K_J = np.matrix([[1.5], [-1.2], [1.2], [1.2]])
+                K_R = np.matrix([[0], [0], [0]])
+            
 
 
         ###############################################################################
