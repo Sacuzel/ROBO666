@@ -408,7 +408,7 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         self.excavator =  excavator
         self.chain = chain
         self.targetPose = targetPose
-        self.tolerance = 0.05
+        self.tolerance = 0.1
         self.damp = 0.5
         self.distance_error = 0
         self.done = False
@@ -428,10 +428,11 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         self.previousAngles = collections.OrderedDict()
         self.previousBucketPos = agx.AffineMatrix4x4()
         self.previousTargetReceive = agx.AffineMatrix4x4()
+        self.previousExcavator_body_transform_inv = agx.AffineMatrix4x4()
 
-        #=#=#=#=#=#
-        self.moveFlag = False # Manually change this if you want trajectory following
-        #=#=#=#=#=#
+        self.previousTarget_in_body_frame = agx.AffineMatrix4x4()
+        self.previousBucket_in_body_frame = agx.AffineMatrix4x4()
+        self.previousBucket_world_pos = agx.AffineMatrix4x4()
 
         self.current_index = 0
         self.constraints = collections.OrderedDict()
@@ -453,74 +454,35 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         
     # Getter and setter for joint angles and velocities
 
-    def getJointAngles(self):
+    def getJointAngles(self, joints = None):
+        # This function picks the joint angles of the excavator if the provided joint values from ROS2 are not available
 
         angles = collections.OrderedDict()
 
-        # Update the angles if ROS2 subscriber returns empty
-        # Target joint angles in Unreal Engine (base frame)
-        msg_jointReceive = agxROS2.SensorMsgsJointState()
+        if self.usingUnrealValues:
+            print("\n===USING UNREAL ANGLES!!! ===\n")
 
-        if subscriber_joints.receiveMessage(msg_jointReceive):
-            self.usingUnrealValues = True
-            print("\n===USING UNREAL VALUES!!! ===\n")
             angles.clear()
-            tempAngles = msg_jointReceive.position
-            tempNames = msg_jointReceive.name
 
-            # Add each joint and its respective angle value
-            angles[tempNames[0]] = tempAngles[0]
-            angles[tempNames[1]] = tempAngles[1]
-            angles[tempNames[2]] = tempAngles[2]
-            angles[tempNames[3]] = tempAngles[3]
-
-            self.previousAngles = angles # Save previos values in case ROS2 does not respond immeadiately
-
+            for i, name in enumerate(self.constraints):
+                angles[name] = joints[i]  # Use Unreal values for joint angles
+            
         else: # Use agx angles to perform the simulation
-            if(not self.usingUnrealValues):
-                print("\n===USING SYSTEM VALUES!!! ===\n")
+            print("\n===USING SYSTEM ANGLES!!! ===\n")
 
-                angles.clear()
-                for name in self.constraints:
-                    angles[name] = self.constraints[name].getAngle()
-            else:
-                print("\nUSING PREVIOUS JOINT VALUES!\n")
-                angles = self.previousAngles
+            angles.clear()
+            for name in self.constraints:
+                angles[name] = self.constraints[name].getAngle()
         
         return angles
 
     def setTargetVelocity(self, q_dot_cmd): # Create joint velocities
         self.joint_target_vel = collections.OrderedDict()
-        #print("\nShape of q_dot_cmd:", q_dot_cmd.shape)
 
         for i, (name, constraint) in enumerate(self.constraints.items()):
-            #print(name)
-            #print(q_dot_cmd[i, 0])
             self.joint_target_vel[name] = q_dot_cmd[i, 0]  # Extract scalar value for the joint
 
         self.updateJointVelocities()
-
-    # This function calculates pseudo-inverse jacobian with a dampening factor using DLS
-    def computePseudoInverse(self, J):
-        #print(f"Shape of J before transpose: {J.shape}")
-
-        JT = np.transpose(J)  # n x m
-        #print(f"Shape of JT: {JT.shape}")
-        
-        JJt = J @ JT  # m x m
-        #print(f"Shape of JJt: {JJt.shape}")
-        
-        identity = np.eye(JJt.shape[0])  # Identity matrix with size m x m
-        
-        try:
-            inv = np.linalg.inv(JJt + self.damp**2 * identity)  # m x m
-        except np.linalg.LinAlgError:
-            print("Matrix inversion failed. The matrix may be singular.")
-            return None
-        
-        J_pseudo = JT @ inv  # n x m
-        
-        return J_pseudo
 
     def updateJointVelocities(self):
         for name in self.constraints:
@@ -538,33 +500,105 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
 
     def pre(self, time):
         
+        # The section below will only kick in if the Unreal Engine bridge is available
+        #########################################################################################
+        msg_bucketCarriageJointReceive = agxROS2.StdMsgsFloat64MultiArray()
+
+        if subscriber_bucket_and_carriage_pos.receiveMessage(msg_bucketCarriageJointReceive):
+            self.usingUnrealValues = True
+            print("\n=== USING UNREAL VALUES FOR POSES!!! ===\n")
+
+            # Extract the position data (coordinates) from the ROS2 message
+            undercarriage_pos_unreal = np.array(msg_bucketCarriageJointReceive.data[:3])
+            bucket_pos_unreal = np.array(msg_bucketCarriageJointReceive.data[3:6])
+            unreal_joint_angles = np.array(msg_bucketCarriageJointReceive.data[6:10])
+            unreal_bucket_rotation = agx.Quat(msg_bucketCarriageJointReceive.data[12],msg_bucketCarriageJointReceive.data[11],msg_bucketCarriageJointReceive.data[10],msg_bucketCarriageJointReceive.data[13]) # NOTICE! The order is not 10,11,12,13 due to unreal engine
+            print("\nUNREAL BUCKET ROTATION: ", unreal_bucket_rotation, "\n")
+            #  SYSTEM BUCKET ROTATION: [ -0.00136506, -0.8829, 0.0010398, 0.469558]
+            #  UNREAL BUCKET ROTATION:  [ -0.00234967, -0.885393, 0.00263686, 0.46483]
+
+            # Create the transformation matrix for the undercarriage from Unreal data
+            undercarriage_rotation_unreal = agx.Quat()  # Assuming no rotation for now, WIP for future
+            excavator_body_transform_unreal = agx.AffineMatrix4x4(undercarriage_rotation_unreal, agx.Vec3(*undercarriage_pos_unreal))
+            
+            excavator_body_transform_inv = excavator_body_transform_unreal.inverse()
+            self.previousExcavator_body_transform_inv = excavator_body_transform_inv
+
+            # Now we will transform the target using the Unreal-based undercarriage transform we made above
+            x_next = self.targetPose
+            r_next = unreal_bucket_rotation * agx.Quat(np.pi/8, agx.Vec3.X_AXIS())
+            target_transformation_matrix = agx.AffineMatrix4x4(r_next, agx.Vec3(*x_next))
+
+            target_in_body_frame = target_transformation_matrix * excavator_body_transform_inv
+            self.previousTarget_in_body_frame = target_in_body_frame
+
+            # Get bucket's position in the Unreal Engine world frame
+            bucket_world_frame = agx.AffineMatrix4x4(agx.Quat(), agx.Vec3(*bucket_pos_unreal)) # Assuming no rotation for bucket as well, adjust if needed
+
+            # Transform bucket's world frame to the Unreal-based body frame
+            bucket_in_body_frame = bucket_world_frame * excavator_body_transform_inv
+            self.previousBucket_in_body_frame = bucket_in_body_frame
+
+            bucket_world_pos = bucket_pos_unreal # Use the unreal position for world error calculation
+            self.previousBucket_world_pos = bucket_world_pos
         #########################################################################################
 
-        # Frame calculations
-        # First we will transform target from world frame to excavator's kinematic chain's base frame
-        excavator_body_transform = self.excavator.under_carriage_body.getTransform()
-        excavator_body_transform_inv = excavator_body_transform.inverse()
+        elif not self.usingUnrealValues: # Fallback to AGX Dynamics transform if ROS2 data is not available
+            self.usingUnrealValues = False
+            print("\n===USING SYSTEM VALUES FOR POSES!!! ===\n")
 
-        x_next = self.targetPose
-        r_next = agx.Quat(0, agx.Vec3.X_AXIS())
-        target_transformation_matrix = agx.AffineMatrix4x4(r_next, x_next)
-        target_in_body_frame = target_transformation_matrix * excavator_body_transform_inv
+            # Frame calculations
+            # First we will transform target from world frame to excavator's kinematic chain's base frame
+            excavator_body_transform = self.excavator.under_carriage_body.getTransform()
+            excavator_body_transform_inv = excavator_body_transform.inverse()
 
-        if self.moveFlag:
-            self.create_red_marker(self.targetPose[0], self.targetPose[1], self.targetPose[2], simulation(), root())
+            x_next = self.targetPose
+            r_next = self.excavator.bucket_body.getRotation() # * agx.Quat(np.pi/4, agx.Vec3.X_AXIS())
+            print("\n SYSTEM BUCKET ROTATION:", r_next)
+            target_transformation_matrix = agx.AffineMatrix4x4(r_next, x_next)
+            target_in_body_frame = target_transformation_matrix * excavator_body_transform_inv
+
+            # Now we get the location of excavator's bucket
+            bucket_world_pos = self.excavator.bucket_body.getTransform().getTranslate() # Bucket's world position
+            bucket_world_frame = self.excavator.bucket_body.getTransform()
+
+            # Now we need bucket's position in excavator's body frame as well
+            bucket_in_body_frame = bucket_world_frame * excavator_body_transform_inv
+        #########################################################################################
+
+        else: # use previous values in case a value is skipped in Unreal
+            print("\nSKIPPED ITERATION! (NO ROS2 MESSAGE)")
+            return
+
+            print("\nUSING PREVIOUS UNREAL VALUES!\n")
+
+            #excavator_body_transform_inv = self.previousExcavator_body_transform_inv
+            #target_in_body_frame = self.previousTarget_in_body_frame
+            #bucket_in_body_frame = self.previousBucket_in_body_frame
+            #bucket_world_pos = self.previousBucket_world_pos
+
         # Position of target in base frame
         target_in_body_pos = np.array([target_in_body_frame[3,0], target_in_body_frame[3,1], target_in_body_frame[3,2]])
-
-        # Now we get the location of excavator's bucket
-        bucket_world_pos = self.excavator.bucket_body.getTransform().getTranslate() # Bucket's world position
-        bucket_world_frame = self.excavator.bucket_body.getTransform()
-
-        # Now we need bucket's position in excavator's body frame as well
-        bucket_in_body_frame = bucket_world_frame * excavator_body_transform_inv
+        
         bucket_in_body_pos = np.array([bucket_in_body_frame[3,0], bucket_in_body_frame[3,1], bucket_in_body_frame[3,2]])
 
         # Then we need distance (aka error) between bucket and goal in world frame
-        self.distance_error = (self.targetPose - bucket_world_pos)
+
+        # Manually create a distance error vector
+
+        targetX = self.targetPose[0]
+        targetY = self.targetPose[1]
+        targetZ = self.targetPose[2]
+
+        bucketX = bucket_world_pos[0]
+        bucketY = bucket_world_pos[1]
+        bucketZ = bucket_world_pos[2]
+
+        errorX = targetX - bucketX
+        errorY = targetY - bucketY
+        errorZ = targetZ - bucketZ
+
+        self.distance_error = agx.Vec3(errorX, errorY, errorZ)
 
         if(self.closestDistance == None):
             self.closestDistance = np.sum(np.abs(self.distance_error))
@@ -589,98 +623,66 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         # We will vary the gains based on how far away the bucket is from the target if dynamic gains are enabled
         # Gain values will be automatically increased if ROS2 connection is available
 
-        msg_bucketCarriageReceive = agxROS2.StdMsgsFloat64MultiArray()
-
-
-        if subscriber_bucket_and_carriage_pos.receiveMessage(msg_bucketCarriageReceive):
+        if self.usingUnrealValues:
             print("\n===USING UNREAL GAINS!!! ===\n")
 
             # We will use Unreal engine gains
             if(np.sum(np.abs(self.distance_error)) > self.tolerance * 100 and self.usingDynamicGains):
-                K = np.matrix([[5], [5], [5]]) # Positional gain
-                K_J = np.matrix([[7], [-5], [4], [4]]) # Joint velocity gain
-                K_R = np.matrix([[4], [4], [4]]) # Rotational gain
-                
-            else: # Dynamic gains kick in when target is close enough
-                K = np.matrix([[6], [6], [6]])
-                K_J = np.matrix([[6], [-7], [5], [5]])
-                K_R = np.matrix([[0], [0], [0]])
-        
-        
-        # Use original gain values for agxDynamics simulation
-        else:
-            print("\n===USING SYSTEM GAINS!!! ===\n")
-
-            if(np.sum(np.abs(self.distance_error)) > self.tolerance * 100 and self.usingDynamicGains):
-                K = np.matrix([[0.7], [0.7], [0.7]]) # Positional gain
-                K_J = np.matrix([[1], [-0.7], [0.5], [0.5]]) # Joint velocity gain
-                K_R = np.matrix([[0.5], [0.5], [0.5]]) # Rotational gain
+                K = np.matrix([[10], [10], [10]]) # Positional gain
+                K_J = np.matrix([[10], [-10], [10], [10]]) # Joint velocity gain
+                K_R = np.matrix([[10], [10], [10]]) # Rotational gain
 
             elif(np.sum(np.abs(self.distance_error)) > self.tolerance * 10 and self.usingDynamicGains):
                 K = np.matrix([[1.2], [1.2], [1.2]])
                 K_J = np.matrix([[1.2], [-1.0], [1.0], [1.0]])
                 K_R = np.matrix([[0], [0], [0]])
+        
+        
+        # Use original gain values for agxDynamics simulation
+        
+        else:
+            print("\n===USING SYSTEM GAINS!!! ===\n")
+
+            if(np.sum(np.abs(self.distance_error)) >= self.tolerance * 50 and self.usingDynamicGains):
+                K = np.matrix([[0.7], [0.7], [0.7]]) # Positional gain
+                K_J = np.matrix([[1], [-0.7], [0.5], [0.5]]) # Joint velocity gain
+                K_R = np.matrix([[0.5], [0.5], [0.5]]) # Rotational gain
+
+            elif(np.sum(np.abs(self.distance_error)) < self.tolerance * 50 and np.sum(np.abs(self.distance_error)) >= self.tolerance * 10 and self.usingDynamicGains):
+                K = np.matrix([[1.2], [1.2], [1.2]])
+                K_J = np.matrix([[1.2], [-1.0], [1.0], [1.0]])
+                K_R = np.matrix([[0.5], [0.5], [0.5]])
             
             else: # Dynamic gains kick in when target is close enough
                 K = np.matrix([[1.5], [1.5], [1.5]])
                 K_J = np.matrix([[1.5], [-1.2], [1.2], [1.2]])
-                K_R = np.matrix([[0], [0], [0]])
-            
+                K_R = np.matrix([[0.5], [0.5], [0.5]])
 
-
-        ###############################################################################
-        # Compute both position and orientation error
-        # Make the target move
-
-        # First manually create transformation matrix for the bucket in body frame
-        bucket_next = [bucket_in_body_frame[3,0], bucket_in_body_frame[3,1], bucket_in_body_frame[3,2]]
-        bucket_next = agx.Vec3(bucket_next[0], bucket_next[1], bucket_next[2])
-        r_next = agx.Quat(0, agx.Vec3.X_AXIS())
-        bucket_body_trans = agx.AffineMatrix4x4(r_next, bucket_next)
-
-        if self.moveFlag: # If we want the target to move
-            if time < self.duration:
-                X_d = self.move_target(time, x_0=bucket_body_trans, pos = bucket_in_body_pos)
-            else:
-                X_d = target_in_body_frame
-        else:
-            X_d = target_in_body_frame
+        ###############################
+        #Temporary
+        #K = np.matrix([[0.7], [0.7], [0.7]]) # Positional gain
+        #K_J = np.matrix([[1], [-0.7], [0.5], [0.5]]) # Joint velocity gain
+        #K_R = np.matrix([[0.5], [0.5], [0.5]]) # Rotational gain
+        ###############################
+    
+        X_d = target_in_body_frame
         
         X = bucket_in_body_frame
-
-        ##########################################################################
-
-
-        ##########################################################################
 
         pos_rot_error = self.angle_axis_error(X, X_d)
         e = pos_rot_error
         print("\n#=#=#=#=#=#=#\nERROR MATRIX:\n", e, "\n#=#=#=#=#=#=#\n")
 
-        ###############################################################################
-        # Compute the error while ignoring rotation if target is close enough
-        
-        #e = [pos_rot_error[0], pos_rot_error[1], pos_rot_error[2], 0, 0, 0] # Test to see whether angle_axis_error works without angular values
-        
-        distance_error_vector = [pos_rot_error[0], pos_rot_error[1], pos_rot_error[2], 0, 0, 0]
-
-        ##########################################################################
-        # IF UNREAL ENGINE IS AVAILABLE
-        # Use ROS2 values for error calculation
-        #msg_targetReceiveInBody = agxROS2.StdMsgsFloat64MultiArray()
-
-        #if subscriber_bucket_in_body.receiveMessage(msg_targetReceiveInBody):
-            #self.usingUnrealValues = True
-            #print("\n=== DISTANCE USING UNREAL VALUES!!! ===\n")
-            #self.done = msg_targetReceiveInBody.data[3] < self.tolerance
-        ##########################################################################
-
-        self.done = np.sum(np.abs(distance_error_vector)) < self.tolerance
+        self.done = np.sum(np.abs(e)) < self.tolerance
 
         # Compute desired end-effector velocity
         x_dot_desired = np.matrix([[K[0, 0] * e[0]], [K[1, 0] * e[1]], [K[2, 0] * e[2]], [K_R[0, 0] * e[3]], [K_R[1, 0] * e[4]], [K_R[2, 0] * e[5]]])  # 6 x 1 vector
 
-        q = self.getJointAngles()
+        if self.usingUnrealValues:
+            q = self.getJointAngles(unreal_joint_angles)
+
+        else:
+            q = self.getJointAngles()
 
         # Change angles to a list and Compute Jacobian
         q_list = list(q.values())
@@ -702,8 +704,7 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         
         #print("\nJacobian array:", jacobian_array)
 
-        # Compute pseudo-inverse of Jacobian (we are using built in pinv instead of 
-        # our own DLS function as we don't need the dampening after all)
+        # Compute pseudo-inverse of Jacobian
         J_pseudo = np.linalg.pinv(jacobian_array) # n x m matrix
 
         # Compute joint velocities
@@ -746,17 +747,8 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
             for sphere in self.visual_trace:
                 simulation().remove(sphere)
             self.visual_trace.clear()  # Clear the list after removing the spheres
-            
-            # Remove the target visual spheres
-            """
-            # Remove the target visual spheres
-            for sphere in self.visual_trace_target:
-                simulation().remove(sphere)
-            self.visual_trace_target.clear() # Clear the list after removing the spheres
-            """
             ####################################
             simulation().remove(self)
-
 
         elif self.done and self.myTimer.getTime() < self.timeLimit:
             duration = self.myTimer.getTime()
@@ -772,31 +764,8 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
             for sphere in self.visual_trace:
                 simulation().remove(sphere)
             self.visual_trace.clear()  # Clear the list after removing the spheres
-            """
-            # Remove the target visual spheres
-            for sphere in self.visual_trace_target:
-                simulation().remove(sphere)
-            self.visual_trace_target.clear() # Clear the list after removing the spheres
-            """
             ####################################
             simulation().remove(self)
-
-    def move_target(self, time, radius=0.2, omega=0.3 * np.pi, x_0 = None, pos = None):
-        '''
-        Translate the target in a circle while also rotating it.
-        '''
-        x = pos[0]
-        y = pos[1] + radius * np.cos(omega * time)
-        z = pos[2] + radius * np.sin(omega * time)
-        x_next = agx.Vec3(x, y, z)
-
-        r_next = x_0.getRotate() * agx.Quat(0.3 * omega * time, agx.Vec3.X_AXIS())
-
-        # Apply the next pose to the target geometry for visualization.
-        X_next = agx.AffineMatrix4x4(r_next, x_next)
-        self.target.getFrame().setMatrix(X_next)
-
-        return X_next
     
     def create_red_marker(self, x, y, z, sim, root):
         """
@@ -852,7 +821,7 @@ class TaskSpaceVelocityController(agxSDK.StepEventListener):
         # orientation error using angle axis
         quat = agx.Quat(X)
         quat_d = agx.Quat(X_d)
-        quat_err = quat.inverse() * quat_d # ORIGINALLY quat.inverse() * quat_d
+        quat_err = quat.inverse() * quat_d
 
         angle_err = quat_err.getAngle()
         angle_err = (angle_err + np.pi) % (2 * np.pi) - np.pi  # get into [-pi, pi]
